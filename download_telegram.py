@@ -1,20 +1,166 @@
 import os
 import sys
 import time
+import math
+import hashlib
+import inspect
 import asyncio
-from telethon import TelegramClient
+from collections import defaultdict
+from typing import Optional, List, AsyncGenerator, Union, Awaitable, DefaultDict, Tuple, BinaryIO
+
+from telethon import TelegramClient, utils, helpers
+from telethon.crypto import AuthKey
+from telethon.network import MTProtoSender
+from telethon.tl.alltlobjects import LAYER
+from telethon.tl.functions import InvokeWithLayerRequest
+from telethon.tl.functions.auth import ExportAuthorizationRequest, ImportAuthorizationRequest
+from telethon.tl.functions.upload import GetFileRequest
 
 # Enable ANSI escape codes in Windows Command Prompt
 if os.name == 'nt':
     try:
         import ctypes
         kernel32 = ctypes.windll.kernel32
-        # Enable ENABLE_VIRTUAL_TERMINAL_PROCESSING (0x0004) for stdout (-11)
         kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
     except Exception:
         pass
 
-# Dashboard state management
+# ----------------- PARALLEL DOWNLOAD UTILITIES -----------------
+
+TypeLocation = Union[InputDocumentFileLocation, InputPhotoFileLocation, InputPeerPhotoFileLocation, InputFileLocation]
+
+class DownloadSender:
+    client: TelegramClient
+    sender: MTProtoSender
+    request: GetFileRequest
+    remaining: int
+    stride: int
+
+    def __init__(self, client: TelegramClient, sender: MTProtoSender, file: TypeLocation, offset: int, limit: int,
+                 stride: int, count: int) -> None:
+        self.sender = sender
+        self.client = client
+        self.request = GetFileRequest(file, offset=offset, limit=limit)
+        self.stride = stride
+        self.remaining = count
+
+    async def next(self) -> Optional[bytes]:
+        if not self.remaining:
+            return None
+        result = await self.client._call(self.sender, self.request)
+        self.remaining -= 1
+        self.request.offset += self.stride
+        return result.bytes
+
+    def disconnect(self) -> Awaitable[None]:
+        return self.sender.disconnect()
+
+class ParallelTransferrer:
+    client: TelegramClient
+    loop: asyncio.AbstractEventLoop
+    dc_id: int
+    senders: Optional[List[DownloadSender]]
+    auth_key: AuthKey
+
+    def __init__(self, client: TelegramClient, dc_id: Optional[int] = None) -> None:
+        self.client = client
+        self.loop = self.client.loop
+        self.dc_id = dc_id or self.client.session.dc_id
+        self.auth_key = (None if dc_id and self.client.session.dc_id != dc_id
+                         else self.client.session.auth_key)
+        self.senders = None
+
+    async def _cleanup(self) -> None:
+        await asyncio.gather(*[sender.disconnect() for sender in self.senders])
+        self.senders = None
+
+    @staticmethod
+    def _get_connection_count(file_size: int, max_count: int = 4,
+                               full_size: int = 100 * 1024 * 1024) -> int:
+        # We cap at 4 connections per file to prevent FloodWait rate limits
+        if file_size > full_size:
+            return max_count
+        return max(1, math.ceil((file_size / full_size) * max_count))
+
+    async def _init_download(self, connections: int, file: TypeLocation, part_count: int,
+                             part_size: int) -> None:
+        minimum, remainder = divmod(part_count, connections)
+
+        def get_part_count() -> int:
+            nonlocal remainder
+            if remainder > 0:
+                remainder -= 1
+                return minimum + 1
+            return minimum
+
+        # The first cross-DC sender exports+imports authorization first
+        self.senders = [
+            await self._create_download_sender(file, 0, part_size, connections * part_size,
+                                               get_part_count()),
+            *await asyncio.gather(
+                *[self._create_download_sender(file, i, part_size, connections * part_size,
+                                               get_part_count())
+                  for i in range(1, connections)])
+        ]
+
+    async def _create_download_sender(self, file: TypeLocation, index: int, part_size: int,
+                                      stride: int, part_count: int) -> DownloadSender:
+        return DownloadSender(self.client, await self._create_sender(), file, index * part_size, part_size,
+                              stride, part_count)
+
+    async def _create_sender(self) -> MTProtoSender:
+        dc = await self.client._get_dc(self.dc_id)
+        sender = MTProtoSender(self.auth_key, loggers=self.client._log)
+        await sender.connect(self.client._connection(dc.ip_address, dc.port, dc.id,
+                                                      loggers=self.client._log,
+                                                      proxy=self.client._proxy))
+        if not self.auth_key:
+            auth = await self.client(ExportAuthorizationRequest(self.dc_id))
+            self.client._init_request.query = ImportAuthorizationRequest(id=auth.id,
+                                                                         bytes=auth.bytes)
+            req = InvokeWithLayerRequest(LAYER, self.client._init_request)
+            await sender.send(req)
+            self.auth_key = sender.auth_key
+        return sender
+
+    async def download(self, file: TypeLocation, file_size: int,
+                       part_size_kb: Optional[float] = None,
+                       connection_count: Optional[int] = None) -> AsyncGenerator[bytes, None]:
+        connection_count = connection_count or self._get_connection_count(file_size)
+        part_size = (part_size_kb or utils.get_appropriated_part_size(file_size)) * 1024
+        part_count = math.ceil(file_size / part_size)
+        
+        await self._init_download(connection_count, file, part_count, part_size)
+
+        part = 0
+        while part < part_count:
+            tasks = []
+            for sender in self.senders:
+                tasks.append(self.loop.create_task(sender.next()))
+            for task in tasks:
+                data = await task
+                if not data:
+                    break
+                yield data
+                part += 1
+
+        await self._cleanup()
+
+async def parallel_download_file(client: TelegramClient, location, out: BinaryIO, progress_callback=None) -> BinaryIO:
+    size = location.size
+    dc_id, location = utils.get_input_location(location)
+    downloader = ParallelTransferrer(client, dc_id)
+    downloaded = downloader.download(location, size)
+    async for chunk in downloaded:
+        out.write(chunk)
+        if progress_callback:
+            r = progress_callback(out.tell(), size)
+            if inspect.isawaitable(r):
+                await r
+    return out
+
+# ----------------- DASHBOARD & STATE -----------------
+
 active_downloads = {}
 dashboard_lock = asyncio.Lock()
 num_lines_drawn = 0
@@ -23,7 +169,6 @@ last_draw_time = 0
 async def clear_dashboard():
     global num_lines_drawn
     if num_lines_drawn > 0:
-        # Move cursor up, clear line, and do it for all lines drawn
         sys.stdout.write(f"\033[{num_lines_drawn}A")
         for _ in range(num_lines_drawn):
             sys.stdout.write("\033[K\n")
@@ -61,7 +206,6 @@ async def draw_dashboard_instantly():
         else:
             eta_str = "--"
             
-        # Format filename to fit the display line nicely
         display_name = fname if len(fname) <= 35 else f"{fname[:16]}...{fname[-16:]}"
         lines.append(f" 📂 {display_name:<35} | {pct:5.1f}% | {rec_mb:6.1f}/{tot_str:<8} | {speed_mb:5.2f} MB/s | ETA: {eta_str}")
     lines.append("--------------------------------------------------------------------------------")
@@ -80,8 +224,9 @@ async def draw_dashboard():
         await clear_dashboard()
         await draw_dashboard_instantly()
 
+# ----------------- MAIN DOWNLOADER -----------------
+
 async def download_lectures(api_id, api_hash, channel_source, download_dir):
-    # Initialize the client session with retry parameters
     client = TelegramClient(
         'lecture_downloader_session', 
         api_id, 
@@ -94,11 +239,9 @@ async def download_lectures(api_id, api_hash, channel_source, download_dir):
     print("Successfully logged in to Telegram!")
     
     try:
-        # Resolve the channel entity
         channel = await client.get_entity(channel_source)
         print(f"Accessing channel: {channel.title}")
         
-        # Create output directory
         os.makedirs(download_dir, exist_ok=True)
         print(f"Saving lectures to directory: {os.path.abspath(download_dir)}")
         
@@ -107,7 +250,6 @@ async def download_lectures(api_id, api_hash, channel_source, download_dir):
         messages_to_download = []
         async for message in client.iter_messages(channel, reverse=True):
             if message.media:
-                # Determine filename and size
                 filename = None
                 file_size = None
                 
@@ -130,7 +272,6 @@ async def download_lectures(api_id, api_hash, channel_source, download_dir):
 
                 target_path = os.path.join(download_dir, filename)
                 
-                # If file already exists and size matches, skip download
                 if os.path.exists(target_path):
                     if file_size is None or os.path.getsize(target_path) == file_size:
                         continue
@@ -144,14 +285,13 @@ async def download_lectures(api_id, api_hash, channel_source, download_dir):
             
         print(f"Found {total_files} new files to download. Starting concurrent downloads...")
         
-        # 2. Download concurrently using a Semaphore (4 files at a time)
+        # 2. Download concurrently using a Semaphore
         sem = asyncio.Semaphore(4)
         download_count = 0
         
         async def download_task(message, filename, file_size):
             nonlocal download_count
             async with sem:
-                # Initialize active download state tracking
                 active_downloads[filename] = {
                     'received': 0,
                     'total': file_size,
@@ -185,15 +325,25 @@ async def download_lectures(api_id, api_hash, channel_source, download_dir):
                     return progress_callback
                 
                 retry_attempts = 5
+                target_path = os.path.join(download_dir, filename)
+                
                 for attempt in range(retry_attempts):
                     try:
-                        # Start downloading
-                        await message.download_media(
-                            file=download_dir, 
-                            progress_callback=make_progress_callback(filename)
-                        )
+                        # Use parallel chunk downloader for documents (videos/zips), standard downloader for photos
+                        if hasattr(message.media, 'document') and message.media.document:
+                            with open(target_path, 'wb') as out_file:
+                                await parallel_download_file(
+                                    client, 
+                                    message.media.document, 
+                                    out_file, 
+                                    progress_callback=make_progress_callback(filename)
+                                )
+                        else:
+                            await message.download_media(
+                                file=download_dir,
+                                progress_callback=make_progress_callback(filename)
+                            )
                         
-                        # Remove from active status and log completion
                         if filename in active_downloads:
                             del active_downloads[filename]
                         
@@ -201,6 +351,13 @@ async def download_lectures(api_id, api_hash, channel_source, download_dir):
                         await print_log(f"[Finished] Saved: {filename} ({download_count}/{total_files})")
                         break
                     except Exception as download_error:
+                        # Delete partially downloaded file in case of error
+                        if os.path.exists(target_path):
+                            try:
+                                os.remove(target_path)
+                            except Exception:
+                                pass
+                                
                         if attempt < retry_attempts - 1:
                             await print_log(f"[Retry] Connection issue for {filename}, retrying in 5s... (Attempt {attempt + 1}/{retry_attempts})")
                             await asyncio.sleep(5)
@@ -209,11 +366,9 @@ async def download_lectures(api_id, api_hash, channel_source, download_dir):
                                 del active_downloads[filename]
                             await print_log(f"[Error] Failed to download {filename} after {retry_attempts} attempts. Error: {download_error}")
                             
-        # Run all download tasks concurrently
         tasks = [download_task(msg, fname, fsize) for msg, fname, fsize in messages_to_download]
         await asyncio.gather(*tasks)
         
-        # Clear final screen status
         await clear_dashboard()
         print(f"\nDownload session complete! Successfully downloaded {download_count} new files.")
         
@@ -227,16 +382,15 @@ if __name__ == '__main__':
     print("   Telegram Parallel Media Downloader   ")
     print("=========================================\n")
     try:
-        # Prompt for folder first using native GUI dialog popup
         print("Opening folder selection popup...")
         import tkinter as tk
         from tkinter import filedialog
         
         root = tk.Tk()
-        root.withdraw()                  # Hide primary window
-        root.attributes("-topmost", True)  # Pull popup to front
+        root.withdraw()
+        root.attributes("-topmost", True)
         selected_dir = filedialog.askdirectory(title="Select Download Folder for Telegram Lectures")
-        root.destroy()                   # Fully close Tkinter session
+        root.destroy()
         
         if not selected_dir:
             print("No folder selected. Defaulting to 'telegram_lectures' in current directory.\n")
@@ -250,7 +404,6 @@ if __name__ == '__main__':
         api_hash = input("Enter your Telegram App API_HASH: ").strip()
         channel_input = input("Enter the Channel Link or Username (e.g., yourneededlec or https://t.me/DSA): ").strip()
         
-        # Parse channel name if it's a full link
         if 't.me/' in channel_input:
             channel_source = channel_input.split('t.me/')[-1].strip('/')
         else:
