@@ -1,5 +1,7 @@
 import os
+import re
 import json
+import asyncio
 import tempfile
 import logging
 
@@ -7,6 +9,8 @@ import requests
 import yt_dlp
 from flask import Flask, request
 import telebot
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 import google.oauth2.credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -21,6 +25,11 @@ GDRIVE_CLIENT_ID     = os.environ['GDRIVE_CLIENT_ID']
 GDRIVE_CLIENT_SECRET = os.environ['GDRIVE_CLIENT_SECRET']
 GDRIVE_REFRESH_TOKEN = os.environ['GDRIVE_REFRESH_TOKEN']
 WEBHOOK_URL          = os.environ.get('WEBHOOK_URL', '')
+
+# Telegram USER API (for downloading from t.me links)
+TG_API_ID       = int(os.environ.get('TELEGRAM_API_ID', 0))
+TG_API_HASH     = os.environ.get('TELEGRAM_API_HASH', '')
+TG_SESSION      = os.environ.get('TELEGRAM_SESSION_STRING', '')
 
 # GDRIVE_FOLDERS env var: JSON like {"lectures":"id1","projects":"id2"}
 # The key "default" always maps to GDRIVE_FOLDER_ID
@@ -92,6 +101,62 @@ def is_url(text):
 
 def is_youtube(url):
     return 'youtube.com' in url or 'youtu.be' in url
+
+def is_telegram_link(url):
+    return 't.me/' in url or 'telegram.me/' in url
+
+def parse_tg_link(url):
+    """
+    Parse a t.me link and return (channel, message_id).
+    Supports:
+      https://t.me/username/123
+      https://t.me/c/1234567890/123  (private channel)
+    """
+    # Private channel: t.me/c/CHANNEL_ID/MSG_ID
+    m = re.search(r't\.me/c/(-?\d+)/(\d+)', url)
+    if m:
+        return int('-100' + m.group(1)), int(m.group(2))
+    # Public channel: t.me/username/MSG_ID
+    m = re.search(r't\.me/([^/]+)/(\d+)', url)
+    if m:
+        return m.group(1), int(m.group(2))
+    return None, None
+
+async def _download_tg_link(url, tmp_dir, progress_cb=None):
+    """Use Telethon (user account) to download media from a t.me link."""
+    if not TG_API_ID or not TG_API_HASH or not TG_SESSION:
+        raise ValueError("TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_SESSION_STRING not set in env vars.")
+
+    channel, msg_id = parse_tg_link(url)
+    if not channel or not msg_id:
+        raise ValueError("Could not parse Telegram link. Use format: https://t.me/channelname/123")
+
+    client = TelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH)
+    await client.connect()
+    try:
+        message = await client.get_messages(channel, ids=msg_id)
+        if not message or not message.media:
+            raise ValueError("No media found in that Telegram message.")
+
+        filename = None
+        if message.file:
+            filename = message.file.name
+        if not filename:
+            ext = message.file.ext if message.file else '.bin'
+            filename = f"tg_{msg_id}{ext}"
+
+        local_path = os.path.join(tmp_dir, filename)
+
+        def _cb(received, total):
+            if progress_cb and total:
+                pct = int(received / total * 100)
+                progress_cb(received, total, pct)
+
+        await message.download_media(file=local_path, progress_callback=_cb)
+        return local_path, filename
+    finally:
+        await client.disconnect()
+
 
 
 # ─── Folder Commands ──────────────────────────────────────────────────────────
@@ -237,6 +302,44 @@ def handle_file(message):
     except Exception as e:
         update(f"❌ Failed: {str(e)[:300]}")
         logging.exception("File upload error")
+
+
+@bot.message_handler(func=lambda m: m.text and is_url(m.text) and is_telegram_link(m.text))
+def handle_telegram_link(message):
+    if not is_allowed(message): return
+    url = message.text.strip()
+    status_msg = bot.reply_to(message, "🔍 Fetching from Telegram...")
+
+    def update(text):
+        try:
+            bot.edit_message_text(text, message.chat.id, status_msg.message_id, parse_mode='Markdown')
+        except Exception:
+            pass
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            last_pct = [-1]
+
+            def progress(received, total, pct):
+                if pct >= last_pct[0] + 10:
+                    last_pct[0] = pct
+                    update(
+                        f"⬇️ Downloading from Telegram...\n"
+                        f"`{pct}%` — {received/1048576:.1f}/{total/1048576:.1f} MB"
+                    )
+
+            local, filename = asyncio.run(_download_tg_link(url, tmp, progress_cb=progress))
+            size_mb = os.path.getsize(local) / 1048576
+
+            folder_id = get_active_folder(message.from_user.id)
+            folder_name = next((k for k, v in FOLDER_MAP.items() if v == folder_id), folder_id)
+            update(f"☁️ Uploading *{filename}* ({size_mb:.1f} MB) to GDrive...")
+            upload_to_gdrive(local, filename, folder_id=folder_id, status_cb=lambda t: update(t))
+            update(f"✅ *Done!*\n📁 `{filename}`\n💾 {size_mb:.1f} MB\n📂 Folder: *{folder_name}*")
+
+    except Exception as e:
+        update(f"❌ Failed: {str(e)[:300]}")
+        logging.exception("Telegram link error")
 
 
 @bot.message_handler(func=lambda m: m.text and is_url(m.text))
