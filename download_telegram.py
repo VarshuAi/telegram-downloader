@@ -1,9 +1,87 @@
 import os
+import sys
+import time
 import asyncio
 from telethon import TelegramClient
 
+# Enable ANSI escape codes in Windows Command Prompt
+if os.name == 'nt':
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        # Enable ENABLE_VIRTUAL_TERMINAL_PROCESSING (0x0004) for stdout (-11)
+        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+    except Exception:
+        pass
+
 # Destination folder for downloaded lectures
 DOWNLOAD_DIR = 'telegram_lectures'
+
+# Dashboard state management
+active_downloads = {}
+dashboard_lock = asyncio.Lock()
+num_lines_drawn = 0
+last_draw_time = 0
+
+async def clear_dashboard():
+    global num_lines_drawn
+    if num_lines_drawn > 0:
+        # Move cursor up, clear line, and do it for all lines drawn
+        sys.stdout.write(f"\033[{num_lines_drawn}A")
+        for _ in range(num_lines_drawn):
+            sys.stdout.write("\033[K\n")
+        sys.stdout.write(f"\033[{num_lines_drawn}A")
+        sys.stdout.flush()
+        num_lines_drawn = 0
+
+async def print_log(message):
+    async with dashboard_lock:
+        await clear_dashboard()
+        print(message)
+        await draw_dashboard_instantly()
+
+async def draw_dashboard_instantly():
+    global num_lines_drawn
+    if not active_downloads:
+        return
+    
+    lines = []
+    lines.append("--------------------------------------------------------------------------------")
+    lines.append(f"Active Downloads ({len(active_downloads)} files concurrently):")
+    for fname, info in list(active_downloads.items()):
+        rec = info['received']
+        tot = info['total']
+        speed = info['speed']
+        pct = (rec / tot * 100) if tot else 0
+        speed_mb = speed / (1024 * 1024)
+        
+        rec_mb = rec / (1024 * 1024)
+        tot_str = f"{tot / (1024 * 1024):.1f} MB" if tot else "unknown"
+        
+        if speed > 0 and tot:
+            eta = (tot - rec) / speed
+            eta_str = f"{int(eta)}s" if eta < 60 else f"{int(eta//60)}m {int(eta%60)}s"
+        else:
+            eta_str = "--"
+            
+        # Format filename to fit the display line nicely
+        display_name = fname if len(fname) <= 35 else f"{fname[:16]}...{fname[-16:]}"
+        lines.append(f" 📂 {display_name:<35} | {pct:5.1f}% | {rec_mb:6.1f}/{tot_str:<8} | {speed_mb:5.2f} MB/s | ETA: {eta_str}")
+    lines.append("--------------------------------------------------------------------------------")
+    
+    sys.stdout.write("\n".join(lines) + "\n")
+    sys.stdout.flush()
+    num_lines_drawn = len(lines)
+
+async def draw_dashboard():
+    global last_draw_time
+    now = time.time()
+    if now - last_draw_time < 0.5:
+        return
+    last_draw_time = now
+    async with dashboard_lock:
+        await clear_dashboard()
+        await draw_dashboard_instantly()
 
 async def download_lectures(api_id, api_hash, channel_source):
     # Initialize the client session with retry parameters
@@ -16,7 +94,7 @@ async def download_lectures(api_id, api_hash, channel_source):
     )
     
     await client.start()
-    print("\nSuccessfully logged in to Telegram!")
+    print("Successfully logged in to Telegram!")
     
     try:
         # Resolve the channel entity
@@ -31,7 +109,6 @@ async def download_lectures(api_id, api_hash, channel_source):
         print("Scanning channel messages...")
         messages_to_download = []
         async for message in client.iter_messages(channel, reverse=True):
-            # Check if message contains downloadable media (document, video, audio, photo)
             if message.media:
                 # Determine filename and size
                 filename = None
@@ -59,7 +136,6 @@ async def download_lectures(api_id, api_hash, channel_source):
                 # If file already exists and size matches, skip download
                 if os.path.exists(target_path):
                     if file_size is None or os.path.getsize(target_path) == file_size:
-                        # Already downloaded, skip scanning / downloading
                         continue
                 
                 messages_to_download.append((message, filename, file_size))
@@ -78,29 +154,70 @@ async def download_lectures(api_id, api_hash, channel_source):
         async def download_task(message, filename, file_size):
             nonlocal download_count
             async with sem:
+                # Initialize active download state tracking
+                active_downloads[filename] = {
+                    'received': 0,
+                    'total': file_size,
+                    'start_time': time.time(),
+                    'last_update': time.time(),
+                    'last_received': 0,
+                    'speed': 0
+                }
+                
+                def make_progress_callback(fname):
+                    def progress_callback(received, total):
+                        info = active_downloads.get(fname)
+                        if not info:
+                            return
+                        now = time.time()
+                        elapsed = now - info['last_update']
+                        if elapsed >= 0.5 or received == total:
+                            bytes_diff = received - info['last_received']
+                            info['speed'] = bytes_diff / elapsed if elapsed > 0 else 0
+                            info['last_update'] = now
+                            info['last_received'] = received
+                        info['received'] = received
+                        info['total'] = total
+                        
+                        try:
+                            loop = asyncio.get_event_loop()
+                            if loop.is_running():
+                                loop.create_task(draw_dashboard())
+                        except Exception:
+                            pass
+                    return progress_callback
+                
                 retry_attempts = 5
-                size_str = f"{file_size / (1024*1024):.1f} MB" if file_size else "unknown size"
                 for attempt in range(retry_attempts):
                     try:
-                        print(f"[Start] Downloading: {filename} ({size_str})")
+                        # Start downloading
+                        await message.download_media(
+                            file=DOWNLOAD_DIR, 
+                            progress_callback=make_progress_callback(filename)
+                        )
                         
-                        # Download file in parallel
-                        path = await message.download_media(file=DOWNLOAD_DIR)
+                        # Remove from active status and log completion
+                        if filename in active_downloads:
+                            del active_downloads[filename]
                         
                         download_count += 1
-                        print(f"[Finished] Saved: {filename} ({download_count}/{total_files})")
+                        await print_log(f"[Finished] Saved: {filename} ({download_count}/{total_files})")
                         break
                     except Exception as download_error:
                         if attempt < retry_attempts - 1:
-                            print(f"[Retry] Connection issue for {filename}, retrying in 5s... (Attempt {attempt + 1}/{retry_attempts})")
+                            await print_log(f"[Retry] Connection issue for {filename}, retrying in 5s... (Attempt {attempt + 1}/{retry_attempts})")
                             await asyncio.sleep(5)
                         else:
-                            print(f"[Error] Failed to download {filename} after {retry_attempts} attempts. Error: {download_error}")
+                            if filename in active_downloads:
+                                del active_downloads[filename]
+                            await print_log(f"[Error] Failed to download {filename} after {retry_attempts} attempts. Error: {download_error}")
                             
         # Run all download tasks concurrently
         tasks = [download_task(msg, fname, fsize) for msg, fname, fsize in messages_to_download]
         await asyncio.gather(*tasks)
         
+        # Clear final screen status
+        await clear_dashboard()
         print(f"\nDownload session complete! Successfully downloaded {download_count} new files.")
         
     except Exception as e:
