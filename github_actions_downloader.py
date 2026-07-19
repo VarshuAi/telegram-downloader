@@ -141,6 +141,41 @@ async def parallel_download_file(client, location, out, progress_callback=None):
                 await r
     return out
 
+def make_dl_progress(filename, file_size):
+    """Returns a progress callback that prints speed/ETA every 10% to GitHub Actions logs."""
+    state = {
+        'last_pct': -1,
+        'start_time': time.time(),
+        'last_time': time.time(),
+        'last_bytes': 0,
+    }
+    short = filename[:30] + '...' if len(filename) > 33 else filename
+
+    def callback(received, total):
+        total = total or file_size or 1
+        pct = int(received / total * 100)
+        # Log every 10% milestone
+        if pct >= state['last_pct'] + 10 or received >= total:
+            state['last_pct'] = pct
+            now = time.time()
+            elapsed = now - state['last_time']
+            total_elapsed = now - state['start_time']
+            speed = (received - state['last_bytes']) / elapsed if elapsed > 0 else 0
+            avg_speed = received / total_elapsed if total_elapsed > 0 else 0
+            remaining = (total - received) / avg_speed if avg_speed > 0 else 0
+            eta_str = f"{int(remaining//60)}m {int(remaining%60)}s" if remaining > 60 else f"{int(remaining)}s"
+            print(
+                f"  ↓ [{short}] {pct:3d}% "
+                f"| {received/1024/1024:.1f}/{total/1024/1024:.1f} MB "
+                f"| {speed/1024/1024:.2f} MB/s (inst) "
+                f"| {avg_speed/1024/1024:.2f} MB/s (avg) "
+                f"| ETA: {eta_str}"
+            )
+            state['last_time'] = now
+            state['last_bytes'] = received
+    return callback
+
+
 # ====================== GOOGLE DRIVE UPLOADER ======================
 
 gdrive_service = None
@@ -198,9 +233,10 @@ def upload_to_gdrive(file_path, filename):
         file_metadata = {'name': filename, 'parents': [GDRIVE_FOLDER_ID]}
         media = MediaFileUpload(file_path, chunksize=10*1024*1024, resumable=True)
         
-        print(f"[GDrive] Uploading {filename} ({file_size_mb:.1f} MB)...")
+        print(f"[GDrive] ↑ Uploading: {filename} ({file_size_mb:.1f} MB)")
         request = gdrive_service.files().create(body=file_metadata, media_body=media, fields='id')
         
+        upload_start = time.time()
         response = None
         last_pct = 0
         while response is None:
@@ -209,9 +245,23 @@ def upload_to_gdrive(file_path, filename):
                 pct = int(status.progress() * 100)
                 if pct >= last_pct + 20:
                     last_pct = pct
-                    print(f"[GDrive] {filename}: {pct}% uploaded")
+                    elapsed = time.time() - upload_start
+                    uploaded_bytes = status.resumable_progress
+                    speed = uploaded_bytes / elapsed if elapsed > 0 else 0
+                    remaining_bytes = file_size_bytes - uploaded_bytes
+                    eta = remaining_bytes / speed if speed > 0 else 0
+                    eta_str = f"{int(eta//60)}m {int(eta%60)}s" if eta > 60 else f"{int(eta)}s"
+                    short = filename[:30] + '...' if len(filename) > 33 else filename
+                    print(
+                        f"  \u2191 [{short}] {pct:3d}% "
+                        f"| {uploaded_bytes/1024/1024:.1f}/{file_size_mb:.1f} MB "
+                        f"| {speed/1024/1024:.2f} MB/s "
+                        f"| ETA: {eta_str}"
+                    )
                     
-        print(f"[GDrive] ✓ Uploaded successfully: {filename}")
+        total_time = time.time() - upload_start
+        avg_up = file_size_bytes / total_time / 1024 / 1024 if total_time > 0 else 0
+        print(f"[GDrive] \u2713 Uploaded: {filename} in {total_time:.1f}s @ avg {avg_up:.2f} MB/s")
         return True
     except Exception as e:
         print(f"[GDrive] Upload failed for {filename}: {e}")
@@ -293,12 +343,14 @@ async def run_pipeline():
                 downloaded = False
                 for attempt in range(5):
                     try:
-                        print(f"[Telegram] Downloading: {filename}")
+                        size_mb = (file_size or 0) / 1024 / 1024
+                        print(f"[Telegram] Downloading: {filename} ({size_mb:.1f} MB)")
+                        cb = make_dl_progress(filename, file_size)
                         if hasattr(message.media, 'document') and message.media.document:
                             with open(local_path, 'wb') as f:
-                                await parallel_download_file(client, message.media.document, f)
+                                await parallel_download_file(client, message.media.document, f, progress_callback=cb)
                         else:
-                            await message.download_media(file=TEMP_DOWNLOAD_DIR)
+                            await message.download_media(file=local_path, progress_callback=cb)
                         downloaded = True
                         print(f"[Telegram] ✓ Downloaded: {filename}")
                         break
@@ -310,9 +362,10 @@ async def run_pipeline():
                             # Too long to wait — fall back to safe standard downloader
                             print(f"[Telegram] FloodWait {wait}s too long for parallel. Falling back to standard download for {filename}")
                             try:
+                                cb = make_dl_progress(filename, file_size)
                                 await message.download_media(
                                     file=local_path,
-                                    progress_callback=None
+                                    progress_callback=cb
                                 )
                                 downloaded = True
                                 print(f"[Telegram] ✓ Downloaded (standard): {filename}")
