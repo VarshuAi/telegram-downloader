@@ -76,9 +76,8 @@ class ParallelTransferrer:
         self.senders = None
 
     @staticmethod
-    def _get_connection_count(file_size: int, max_count: int = 8,
+    def _get_connection_count(file_size: int, max_count: int = 16,
                                full_size: int = 50 * 1024 * 1024) -> int:
-        # We cap at 8 connections per file to prevent FloodWait rate limits
         if file_size > full_size:
             return max_count
         return max(1, math.ceil((file_size / full_size) * max_count))
@@ -127,9 +126,11 @@ class ParallelTransferrer:
     async def download(self, file: TypeLocation, file_size: int,
                        part_size_kb: Optional[float] = None,
                        connection_count: Optional[int] = None) -> AsyncGenerator[bytes, None]:
-        connection_count = connection_count or self._get_connection_count(file_size)
         part_size = (part_size_kb or utils.get_appropriated_part_size(file_size)) * 1024
         part_count = math.ceil(file_size / part_size)
+        
+        # Avoid creating more connections than total parts
+        connection_count = min(connection_count or self._get_connection_count(file_size), part_count)
         
         await self._init_download(connection_count, file, part_count, part_size)
 
@@ -151,7 +152,8 @@ async def parallel_download_file(client: TelegramClient, location, out: BinaryIO
     size = location.size
     dc_id, location = utils.get_input_location(location)
     downloader = ParallelTransferrer(client, dc_id)
-    downloaded = downloader.download(location, size)
+    # Set part_size_kb=512 and connection_count=16 for maximum speed on a single file
+    downloaded = downloader.download(location, size, part_size_kb=512, connection_count=16)
     async for chunk in downloaded:
         out.write(chunk)
         if progress_callback:
@@ -218,7 +220,7 @@ async def draw_dashboard_instantly():
 async def draw_dashboard():
     global last_draw_time
     now = time.time()
-    if now - last_draw_time < 0.5:
+    if now - last_draw_time < 2.0:
         return
     last_draw_time = now
     async with dashboard_lock:
@@ -291,8 +293,8 @@ async def download_lectures(api_id, api_hash, channel_source, download_dir):
             
         print(f"Found {total_files} new files to download. Starting concurrent downloads...")
         
-        # 2. Download concurrently using a Semaphore (2 files at a time)
-        sem = asyncio.Semaphore(2)
+        # 2. Download concurrently using a Semaphore (1 file at a time for maximum chunk throughput)
+        sem = asyncio.Semaphore(1)
         download_count = 0
         
         async def download_task(message, filename, file_size):
@@ -357,7 +359,6 @@ async def download_lectures(api_id, api_hash, channel_source, download_dir):
                         await print_log(f"[Finished] Saved: {filename} ({download_count}/{total_files})")
                         break
                     except Exception as download_error:
-                        # Delete partially downloaded file in case of error
                         if os.path.exists(target_path):
                             try:
                                 os.remove(target_path)
@@ -439,7 +440,6 @@ if __name__ == '__main__':
         if config:
             print("--- Found saved credentials ---")
             print(f"API_ID: {config.get('api_id')}")
-            # Obfuscate API HASH for security on screen
             api_hash_val = config.get('api_hash', '')
             masked_hash = (api_hash_val[:4] + '*' * 10 + api_hash_val[-4:]) if len(api_hash_val) > 8 else '**********'
             print(f"API_HASH: {masked_hash}")
@@ -465,7 +465,6 @@ if __name__ == '__main__':
             else:
                 channel_source = channel_input
             
-            # Save newly input config
             save_config(api_id, api_hash, channel_source)
             
         asyncio.run(download_lectures(api_id, api_hash, channel_source, download_dir))
