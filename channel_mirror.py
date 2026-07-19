@@ -113,6 +113,19 @@ async def mirror():
     print(f"[TG] Source : {src.title}")
     print(f"[TG] Dest   : {dest.title}")
 
+    # ── Scan destination channel for already-mirrored files ──────────────────
+    print("[TG] Scanning destination channel for existing files...")
+    existing_filenames = set()
+    async for msg in client.iter_messages(dest):
+        if msg.file and msg.file.name:
+            existing_filenames.add(msg.file.name.lower().strip())
+        elif msg.message:
+            first_line = msg.message.split('\n')[0]
+            if first_line.startswith("📎 "):
+                existing_filenames.add(first_line[2:].lower().strip())
+
+    print(f"[TG] Found {len(existing_filenames)} files already in destination channel.")
+
     # ── Scan source channel ──────────────────────────────────────────────────
     print("[TG] Scanning source channel for media messages...")
     media_msgs = []
@@ -121,23 +134,11 @@ async def mirror():
         scanned += 1
         if scanned % 100 == 0:
             print(f"  Scanned {scanned} messages... (found {len(media_msgs)} new media so far)")
-        if msg.media and msg.id not in mirrored:
-            media_msgs.append(msg)
+        
+        if not msg.media:
+            continue
 
-    total = len(media_msgs)
-    if total == 0:
-        print("[TG] Nothing new to mirror. All done!")
-        await client.disconnect()
-        return
-
-    print(f"[TG] Found {total} new files to mirror.\n")
-
-    # ── Mirror one by one ────────────────────────────────────────────────────
-    done = 0
-    failed = []
-
-    for msg in media_msgs:
-        # --- Get filename ---
+        # Get filename
         filename = None
         if msg.file:
             filename = msg.file.name
@@ -149,6 +150,33 @@ async def mirror():
         if not filename:
             ext = msg.file.ext if msg.file else '.bin'
             filename = f"msg_{msg.id}{ext}"
+
+        filename_clean = filename.lower().strip()
+
+        # Skip if either ID is in cache OR filename is already in destination channel
+        if msg.id in mirrored or filename_clean in existing_filenames:
+            # Keep cached IDs in sync
+            if msg.id not in mirrored:
+                mirrored.add(msg.id)
+            continue
+
+        media_msgs.append((msg, filename))
+
+    total = len(media_msgs)
+    if total == 0:
+        print("[TG] Nothing new to mirror. All done!")
+        # Save any synced IDs back to the progress file
+        save_mirrored(channel_key, mirrored)
+        await client.disconnect()
+        return
+
+    print(f"[TG] Found {total} new files to mirror.\n")
+
+    # ── Mirror one by one ────────────────────────────────────────────────────
+    done = 0
+    failed = []
+
+    for msg, filename in media_msgs:
 
         file_size = msg.file.size if msg.file else 0
         size_mb = file_size / 1048576
