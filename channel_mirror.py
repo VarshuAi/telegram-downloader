@@ -22,8 +22,19 @@ from telethon.tl.types import DocumentAttributeFilename
 API_ID          = int(os.environ.get('TELEGRAM_API_ID', 0))
 API_HASH        = os.environ.get('TELEGRAM_API_HASH', '')
 SESSION_STRING  = os.environ.get('TELEGRAM_SESSION_STRING', '')
-SOURCE_CHANNEL  = os.environ.get('TELEGRAM_CHANNEL_SOURCE', '')   # source (e.g. @StriverDSA)
-DEST_CHANNEL    = os.environ.get('TELEGRAM_BACKUP_CHANNEL', '')   # your private channel
+
+def parse_channel(val):
+    if not val:
+        return val
+    val_str = str(val).strip()
+    if val_str.startswith('-') and val_str[1:].isdigit():
+        return int(val_str)
+    if val_str.isdigit():
+        return int(val_str)
+    return val_str
+
+SOURCE_CHANNEL  = parse_channel(os.environ.get('TELEGRAM_CHANNEL_SOURCE', ''))   # source (e.g. @StriverDSA)
+DEST_CHANNEL    = parse_channel(os.environ.get('TELEGRAM_BACKUP_CHANNEL', ''))   # your private channel
 PROGRESS_FILE   = 'mirrored_ids.json'   # tracks which message IDs are already mirrored
 TEMP_DIR        = 'temp_mirror'
 # ──────────────────────────────────────────────────────────────────────────────

@@ -14,7 +14,18 @@ from googleapiclient.http import MediaFileUpload
 API_ID               = int(os.environ.get('TELEGRAM_API_ID', 0))
 API_HASH             = os.environ.get('TELEGRAM_API_HASH', '')
 SESSION_STRING       = os.environ.get('TELEGRAM_SESSION_STRING', '')
-CHANNEL_SOURCE       = os.environ.get('TELEGRAM_CHANNEL_SOURCE', '')
+
+def parse_channel(val):
+    if not val:
+        return val
+    val_str = str(val).strip()
+    if val_str.startswith('-') and val_str[1:].isdigit():
+        return int(val_str)
+    if val_str.isdigit():
+        return int(val_str)
+    return val_str
+
+CHANNEL_SOURCE       = parse_channel(os.environ.get('TELEGRAM_CHANNEL_SOURCE', ''))
 GDRIVE_FOLDER_ID     = os.environ.get('GDRIVE_FOLDER_ID', '')
 GDRIVE_CLIENT_ID     = os.environ.get('GDRIVE_CLIENT_ID', '')
 GDRIVE_CLIENT_SECRET = os.environ.get('GDRIVE_CLIENT_SECRET', '')
