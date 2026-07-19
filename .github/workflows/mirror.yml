@@ -1,0 +1,49 @@
+name: Telegram Channel Mirror (Source → Private Backup)
+
+on:
+  workflow_dispatch:   # manual trigger anytime
+  schedule:
+    - cron: '0 */6 * * *'   # auto-runs every 6 hours
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # 6 hour max per run
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install telethon cryptg
+
+      # Restore the progress file (which message IDs are already mirrored)
+      - name: Restore mirror progress
+        uses: actions/cache@v4
+        with:
+          path: mirrored_ids.json
+          key: mirror-progress-${{ github.run_number }}
+          restore-keys: mirror-progress-
+
+      - name: Run channel mirror
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
+          TELEGRAM_CHANNEL_SOURCE: ${{ secrets.TELEGRAM_CHANNEL_SOURCE }}
+          TELEGRAM_BACKUP_CHANNEL: ${{ secrets.TELEGRAM_BACKUP_CHANNEL }}
+        run: python channel_mirror.py
+
+      # Save progress so next run skips already-mirrored files
+      - name: Save mirror progress
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: mirrored_ids.json
+          key: mirror-progress-${{ github.run_number }}
