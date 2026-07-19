@@ -22,7 +22,8 @@ GDRIVE_REFRESH_TOKEN = os.environ.get('GDRIVE_REFRESH_TOKEN', '')
 
 # Using standard single-connection download — no ExportAuthorizationRequest spam
 # GitHub's network is fast enough (30-70 MB/s) without parallel connections
-MAX_CONCURRENT_FILES = 2    # 2 files downloading simultaneously
+# Sequential download — one at a time, no race conditions, no skipped files
+MAX_CONCURRENT_FILES = 1
 TEMP_DOWNLOAD_DIR    = 'temp_downloads'
 # -----------------------------------------------------------------------
 
@@ -233,6 +234,7 @@ async def run_pipeline():
 
         sem = asyncio.Semaphore(MAX_CONCURRENT_FILES)
         done_count = 0
+        failed_files = []
 
         async def process(message, filename, file_size):
             nonlocal done_count
@@ -264,6 +266,7 @@ async def run_pipeline():
 
                 if not downloaded:
                     print(f"[Error] Could not download {filename} after 5 attempts — will retry next run.")
+                    failed_files.append(filename)
                     return
 
                 # --- Upload to Google Drive ---
@@ -276,14 +279,51 @@ async def run_pipeline():
                 if success:
                     done_count += 1
                     print(f"[Done] {filename} ({done_count}/{total})")
+                else:
+                    failed_files.append(filename)
 
         tasks = [process(msg, fname, fsize) for msg, fname, fsize in to_download]
         await asyncio.gather(*tasks)
 
         print(f"\nPipeline complete! Transferred {done_count}/{total} files to Google Drive.")
-        if done_count < total:
-            failed = total - done_count
-            print(f"  {failed} files failed — they will be retried on next scheduled run.")
+        
+        # ── Report any failures ──────────────────────────────────────────────
+        if failed_files:
+            print(f"\n  ⚠️  {len(failed_files)} files FAILED (will retry next run):")
+            for f in failed_files:
+                print(f"    - {f}")
+
+        # ── Detect gaps in GDrive numbering ─────────────────────────────────
+        print("\n[GDrive] Checking for numbered gaps...")
+        page_token = None
+        all_names = []
+        while True:
+            resp = gdrive_service.files().list(
+                q=f"'{GDRIVE_FOLDER_ID}' in parents and trashed = false",
+                fields="nextPageToken, files(name)",
+                pageSize=1000,
+                pageToken=page_token
+            ).execute()
+            all_names += [f['name'] for f in resp.get('files', [])]
+            page_token = resp.get('nextPageToken')
+            if not page_token:
+                break
+
+        # Extract the numeric prefix from each filename (e.g. "045_video.mp4" → 45)
+        present_nums = set()
+        for name in all_names:
+            parts = name.split('_', 1)
+            if parts[0].isdigit():
+                present_nums.add(int(parts[0]))
+
+        if present_nums:
+            expected = set(range(1, max(present_nums) + 1))
+            missing = sorted(expected - present_nums)
+            if missing:
+                print(f"  ⚠️  Missing file numbers in GDrive: {missing}")
+                print("  These will be re-downloaded on the next run.")
+            else:
+                print("  ✅ No gaps — all files present!")
 
     except Exception as e:
         print(f"Error: {e}")
