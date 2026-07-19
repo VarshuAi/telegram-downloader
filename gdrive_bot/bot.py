@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import logging
 
@@ -14,12 +15,28 @@ logging.basicConfig(level=logging.INFO)
 
 # ─── Config from Render Environment Variables ───────────────────────────────
 BOT_TOKEN            = os.environ['BOT_TOKEN']
-ALLOWED_USER_ID      = int(os.environ.get('ALLOWED_USER_ID', 0))  # your Telegram user ID
-GDRIVE_FOLDER_ID     = os.environ['GDRIVE_FOLDER_ID']
+ALLOWED_USER_ID      = int(os.environ.get('ALLOWED_USER_ID', 0))
+GDRIVE_FOLDER_ID     = os.environ['GDRIVE_FOLDER_ID']   # default folder
 GDRIVE_CLIENT_ID     = os.environ['GDRIVE_CLIENT_ID']
 GDRIVE_CLIENT_SECRET = os.environ['GDRIVE_CLIENT_SECRET']
 GDRIVE_REFRESH_TOKEN = os.environ['GDRIVE_REFRESH_TOKEN']
-WEBHOOK_URL          = os.environ.get('WEBHOOK_URL', '')  # your Render app URL
+WEBHOOK_URL          = os.environ.get('WEBHOOK_URL', '')
+
+# GDRIVE_FOLDERS env var: JSON like {"lectures":"id1","projects":"id2"}
+# The key "default" always maps to GDRIVE_FOLDER_ID
+_extra = os.environ.get('GDRIVE_FOLDERS', '{}')
+try:
+    FOLDER_MAP = json.loads(_extra)
+except Exception:
+    FOLDER_MAP = {}
+FOLDER_MAP['default'] = GDRIVE_FOLDER_ID   # always available
+
+# Per-user active folder: { user_id: folder_id }
+active_folder: dict[int, str] = {}
+
+def get_active_folder(user_id: int) -> str:
+    return active_folder.get(user_id, GDRIVE_FOLDER_ID)
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
@@ -39,11 +56,12 @@ def get_gdrive():
     return build('drive', 'v3', credentials=creds)
 
 
-def upload_to_gdrive(file_path, filename, status_cb=None):
+def upload_to_gdrive(file_path, filename, folder_id=None, status_cb=None):
     """Upload file to Google Drive and return the web view link."""
     service = get_gdrive()
+    folder_id = folder_id or GDRIVE_FOLDER_ID
     size_mb = os.path.getsize(file_path) / 1048576
-    metadata = {'name': filename, 'parents': [GDRIVE_FOLDER_ID]}
+    metadata = {'name': filename, 'parents': [folder_id]}
     media = MediaFileUpload(file_path, chunksize=10 * 1024 * 1024, resumable=True)
     req = service.files().create(body=metadata, media_body=media, fields='id,webViewLink')
 
@@ -69,13 +87,81 @@ def is_allowed(message):
         return False
     return True
 
-
 def is_url(text):
     return text.strip().startswith('http://') or text.strip().startswith('https://')
 
-
 def is_youtube(url):
     return 'youtube.com' in url or 'youtu.be' in url
+
+
+# ─── Folder Commands ──────────────────────────────────────────────────────────
+
+@bot.message_handler(commands=['folders'])
+def handle_folders(message):
+    if not is_allowed(message): return
+    uid = message.from_user.id
+    current_id = get_active_folder(uid)
+    current_name = next((k for k, v in FOLDER_MAP.items() if v == current_id), current_id)
+    lines = [f"📂 *Available folders:*\n"]
+    for name, fid in FOLDER_MAP.items():
+        tick = "✅" if fid == current_id else "  "
+        lines.append(f"{tick} `{name}`")
+    lines.append(f"\n🟢 *Active:* `{current_name}`")
+    lines.append("\n💡 Switch with: `/folder name`")
+    bot.reply_to(message, '\n'.join(lines), parse_mode='Markdown')
+
+
+@bot.message_handler(commands=['folder'])
+def handle_set_folder(message):
+    if not is_allowed(message): return
+    uid = message.from_user.id
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        current_id = get_active_folder(uid)
+        current_name = next((k for k, v in FOLDER_MAP.items() if v == current_id), current_id)
+        bot.reply_to(message,
+            f"🟢 Current folder: *{current_name}*\n"
+            f"Usage: `/folder name`\n"
+            f"List folders: `/folders`",
+            parse_mode='Markdown'
+        )
+        return
+
+    name = parts[1].strip().lower()
+    if name in FOLDER_MAP:
+        active_folder[uid] = FOLDER_MAP[name]
+        bot.reply_to(message, f"✅ Switched to folder: *{name}*\nAll uploads will now go there.", parse_mode='Markdown')
+    else:
+        names = ', '.join(f'`{k}`' for k in FOLDER_MAP)
+        bot.reply_to(message,
+            f"❌ Folder `{name}` not found.\n\nAvailable: {names}\n\nAdd one with:\n`/addfolder name folder_id`",
+            parse_mode='Markdown'
+        )
+
+
+@bot.message_handler(commands=['addfolder'])
+def handle_add_folder(message):
+    if not is_allowed(message): return
+    parts = message.text.strip().split()
+    if len(parts) != 3:
+        bot.reply_to(message,
+            "Usage: `/addfolder name folder_id`\n\n"
+            "Example:\n`/addfolder projects 1A2B3C4D5E6F7G8H`\n\n"
+            "Get folder ID from GDrive URL:\n"
+            "`drive.google.com/drive/folders/`*THIS_PART*",
+            parse_mode='Markdown'
+        )
+        return
+    _, name, folder_id = parts
+    name = name.lower()
+    FOLDER_MAP[name] = folder_id
+    uid = message.from_user.id
+    active_folder[uid] = folder_id
+    bot.reply_to(message,
+        f"✅ Added folder *{name}* and switched to it!\n"
+        f"Note: This resets on bot restart. To make it permanent, add `GDRIVE_FOLDERS` env var in Render.",
+        parse_mode='Markdown'
+    )
 
 
 # ─── Bot Handlers ─────────────────────────────────────────────────────────────
@@ -84,11 +170,14 @@ def is_youtube(url):
 def handle_start(message):
     bot.reply_to(message,
         "👋 *Personal GDrive Bot*\n\n"
-        "Send me any of these and I'll save it to your Google Drive:\n\n"
+        "Send me any of these → saved to Google Drive:\n\n"
         "📎 *Any file* (≤20MB) — send directly\n"
         "🎬 *YouTube link* — downloads best quality\n"
-        "🔗 *Any direct download URL* — downloads the file\n\n"
-        "I'll tell you the speed and progress as it goes!",
+        "🔗 *Any direct download URL*\n\n"
+        "📂 *Folder commands:*\n"
+        "`/folder name` — switch active folder\n"
+        "`/folders` — list all folders\n"
+        "`/addfolder name id` — add a new folder\n",
         parse_mode='Markdown'
     )
 
@@ -140,9 +229,10 @@ def handle_file(message):
                 out.write(data)
 
             update(f"☁️ Uploading *{filename}* to GDrive...")
-            upload_to_gdrive(local, filename, status_cb=lambda t: update(t))
-
-            update(f"✅ *Done!*\n📁 `{filename}`\n💾 {size_mb:.1f} MB → saved to Google Drive")
+            folder_id = get_active_folder(message.from_user.id)
+            folder_name = next((k for k, v in FOLDER_MAP.items() if v == folder_id), folder_id)
+            upload_to_gdrive(local, filename, folder_id=folder_id, status_cb=lambda t: update(t))
+            update(f"✅ *Done!*\n📁 `{filename}`\n💾 {size_mb:.1f} MB\n📂 Folder: *{folder_name}*")
 
     except Exception as e:
         update(f"❌ Failed: {str(e)[:300]}")
@@ -211,9 +301,11 @@ def handle_url(message):
                                 update(f"⬇️ Downloading... {pct}% ({done/1048576:.1f}/{total/1048576:.1f} MB)")
 
             size_mb = os.path.getsize(local) / 1048576
+            folder_id = get_active_folder(message.from_user.id)
+            folder_name = next((k for k, v in FOLDER_MAP.items() if v == folder_id), folder_id)
             update(f"☁️ Uploading *{filename}* ({size_mb:.1f} MB) to GDrive...")
-            upload_to_gdrive(local, filename, status_cb=lambda t: update(t))
-            update(f"✅ *Done!*\n📁 `{filename}`\n💾 {size_mb:.1f} MB → saved to Google Drive")
+            upload_to_gdrive(local, filename, folder_id=folder_id, status_cb=lambda t: update(t))
+            update(f"✅ *Done!*\n📁 `{filename}`\n💾 {size_mb:.1f} MB\n📂 Folder: *{folder_name}*")
 
     except Exception as e:
         update(f"❌ Failed: {str(e)[:300]}")
