@@ -26,10 +26,12 @@ GDRIVE_CLIENT_SECRET = os.environ['GDRIVE_CLIENT_SECRET']
 GDRIVE_REFRESH_TOKEN = os.environ['GDRIVE_REFRESH_TOKEN']
 WEBHOOK_URL          = os.environ.get('WEBHOOK_URL', '')
 
-# Telegram USER API (for downloading from t.me links)
-TG_API_ID       = int(os.environ.get('TELEGRAM_API_ID', 0))
-TG_API_HASH     = os.environ.get('TELEGRAM_API_HASH', '')
-TG_SESSION      = os.environ.get('TELEGRAM_SESSION_STRING', '')
+# Telegram USER API (for downloading from t.me links + backup uploads)
+TG_API_ID            = int(os.environ.get('TELEGRAM_API_ID', 0))
+TG_API_HASH          = os.environ.get('TELEGRAM_API_HASH', '')
+TG_SESSION           = os.environ.get('TELEGRAM_SESSION_STRING', '')
+# Your private backup channel: username like @mychannel or numeric ID like -1001234567890
+TG_BACKUP_CHANNEL    = os.environ.get('TELEGRAM_BACKUP_CHANNEL', '')
 
 # GDRIVE_FOLDERS env var: JSON like {"lectures":"id1","projects":"id2"}
 # The key "default" always maps to GDRIVE_FOLDER_ID
@@ -171,6 +173,42 @@ async def _download_tg_link(url, tmp_dir, progress_cb=None):
         await client.disconnect()
 
 
+async def _send_to_backup_channel(file_path, filename, caption=''):
+    """
+    Upload a file as a document to the private backup Telegram channel.
+    force_document=True prevents Telegram from recompressing videos.
+    """
+    if not TG_BACKUP_CHANNEL or not TG_SESSION:
+        return None
+    client = TelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH)
+    await client.connect()
+    try:
+        msg = await client.send_file(
+            TG_BACKUP_CHANNEL,
+            file_path,
+            caption=caption,
+            force_document=True,       # no recompression, original quality
+            supports_streaming=True,   # still streamable in TG apps
+        )
+        if msg and msg.id:
+            ch = TG_BACKUP_CHANNEL.lstrip('@')
+            return f"https://t.me/{ch}/{msg.id}" if not str(ch).lstrip('-').isdigit() else None
+        return None
+    finally:
+        await client.disconnect()
+
+
+def backup_to_channel(file_path, filename, gdrive_link):
+    """Sync wrapper — runs the async upload in a new event loop."""
+    if not TG_BACKUP_CHANNEL:
+        return None
+    try:
+        caption = f"📎 {filename}\n🔗 GDrive: {gdrive_link}"
+        return asyncio.run(_send_to_backup_channel(file_path, filename, caption))
+    except Exception as e:
+        logging.warning(f"Backup channel upload failed: {e}")
+        return None
+
 
 # ─── Folder Commands ──────────────────────────────────────────────────────────
 
@@ -310,13 +348,21 @@ def handle_file(message):
             folder_id = get_active_folder(message.from_user.id)
             folder_name = next((k for k, v in FOLDER_MAP.items() if v == folder_id), folder_id)
             link = upload_to_gdrive(local, filename, folder_id=folder_id, status_cb=lambda t: update(t))
-            update(
+            done_text = (
                 f"✅ *Done!*\n"
                 f"📁 `{filename}`\n"
                 f"💾 {size_mb:.1f} MB\n"
                 f"📂 Folder: *{folder_name}*\n"
                 f"🔗 [Open in Drive]({link})"
             )
+            if TG_BACKUP_CHANNEL:
+                update("☁️ Backing up to your private channel...")
+                tg_link = backup_to_channel(local, filename, link)
+                if tg_link:
+                    done_text += f"\n📲 [View in Telegram]({tg_link})"
+                else:
+                    done_text += "\n📲 Backed up to private channel"
+            update(done_text)
 
     except Exception as e:
         update(f"❌ Failed: {str(e)[:300]}")
@@ -361,10 +407,23 @@ def handle_telegram_link(message):
                 f"📂 Folder: *{folder_name}*\n"
                 f"🔗 [Open in Drive]({link})"
             )
+            # Backup to private Telegram channel
+            if TG_BACKUP_CHANNEL:
+                update("☁️ Backing up to your private channel...")
+                tg_link = backup_to_channel(local, filename, link)
+                done_text = (
+                    f"✅ *Done!*\n"
+                    f"📁 `{filename}`\n"
+                    f"💾 {size_mb:.1f} MB\n"
+                    f"📂 Folder: *{folder_name}*\n"
+                    f"🔗 [Open in Drive]({link})"
+                )
+                if tg_link:
+                    done_text += f"\n📲 [View in Telegram]({tg_link})"
+                else:
+                    done_text += "\n📲 Backed up to private channel"
+                update(done_text)
 
-    except Exception as e:
-        update(f"❌ Failed: {str(e)[:300]}")
-        logging.exception("Telegram link error")
 
 
 @bot.message_handler(func=lambda m: m.text and is_url(m.text))
@@ -440,10 +499,23 @@ def handle_url(message):
                 f"📂 Folder: *{folder_name}*\n"
                 f"🔗 [Open in Drive]({link})"
             )
+            # Backup to private Telegram channel
+            if TG_BACKUP_CHANNEL:
+                update("☁️ Backing up to your private channel...")
+                tg_link = backup_to_channel(local, filename, link)
+                done_text = (
+                    f"✅ *Done!*\n"
+                    f"📁 `{filename}`\n"
+                    f"💾 {size_mb:.1f} MB\n"
+                    f"📂 Folder: *{folder_name}*\n"
+                    f"🔗 [Open in Drive]({link})"
+                )
+                if tg_link:
+                    done_text += f"\n📲 [View in Telegram]({tg_link})"
+                else:
+                    done_text += "\n📲 Backed up to private channel"
+                update(done_text)
 
-    except Exception as e:
-        update(f"❌ Failed: {str(e)[:300]}")
-        logging.exception("URL download error")
 
 
 @bot.message_handler(func=lambda m: True)
