@@ -1,0 +1,8 @@
+flask==3.0.3
+pyTelegramBotAPI==4.21.0
+yt-dlp==2024.8.6
+requests==2.32.3
+google-auth==2.35.0
+google-auth-httplib2==0.2.0
+google-api-python-client==2.149.0
+gunicorn==22.0.0

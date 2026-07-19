@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: gdrive-telegram-bot
+    runtime: python
+    rootDir: gdrive_bot
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn bot:app --bind 0.0.0.0:$PORT --workers 1 --timeout 600
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ALLOWED_USER_ID
+        sync: false
+      - key: GDRIVE_FOLDER_ID
+        sync: false
+      - key: GDRIVE_CLIENT_ID
+        sync: false
+      - key: GDRIVE_CLIENT_SECRET
+        sync: false
+      - key: GDRIVE_REFRESH_TOKEN
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
