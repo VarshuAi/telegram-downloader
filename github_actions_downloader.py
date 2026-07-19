@@ -31,7 +31,7 @@ GDRIVE_CLIENT_ID        = os.environ.get('GDRIVE_CLIENT_ID', '')
 GDRIVE_CLIENT_SECRET    = os.environ.get('GDRIVE_CLIENT_SECRET', '')
 GDRIVE_REFRESH_TOKEN    = os.environ.get('GDRIVE_REFRESH_TOKEN', '')
 
-MAX_CONCURRENT_FILES    = 2
+MAX_CONCURRENT_FILES    = 4   # GitHub Actions has fast network, 4 concurrent is safe
 CONNECTIONS_PER_FILE    = 4
 CHUNK_SIZE_KB           = 512
 TEMP_DOWNLOAD_DIR       = 'temp_downloads'

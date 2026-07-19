@@ -4,9 +4,9 @@ on:
   # Allows you to manually trigger this from the GitHub Actions tab
   workflow_dispatch:
   
-  # OPTIONAL: Uncomment the lines below to run automatically every day at midnight IST (18:30 UTC)
-  # schedule:
-  #   - cron: '30 18 * * *'
+  # Auto-runs every 6 hours — keeps downloading until ALL files are done
+  schedule:
+    - cron: '0 */6 * * *'
 
 jobs:
   download-and-upload:
