@@ -76,9 +76,9 @@ class ParallelTransferrer:
         self.senders = None
 
     @staticmethod
-    def _get_connection_count(file_size: int, max_count: int = 4,
-                               full_size: int = 100 * 1024 * 1024) -> int:
-        # We cap at 4 connections per file to prevent FloodWait rate limits
+    def _get_connection_count(file_size: int, max_count: int = 8,
+                               full_size: int = 50 * 1024 * 1024) -> int:
+        # We cap at 8 connections per file to prevent FloodWait rate limits
         if file_size > full_size:
             return max_count
         return max(1, math.ceil((file_size / full_size) * max_count))
@@ -286,8 +286,8 @@ async def download_lectures(api_id, api_hash, channel_source, download_dir):
             
         print(f"Found {total_files} new files to download. Starting concurrent downloads...")
         
-        # 2. Download concurrently using a Semaphore
-        sem = asyncio.Semaphore(4)
+        # 2. Download concurrently using a Semaphore (2 files at a time)
+        sem = asyncio.Semaphore(2)
         download_count = 0
         
         async def download_task(message, filename, file_size):
