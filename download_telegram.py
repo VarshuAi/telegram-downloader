@@ -246,39 +246,44 @@ async def download_lectures(api_id, api_hash, channel_source, download_dir):
         os.makedirs(download_dir, exist_ok=True)
         print(f"Saving lectures to directory: {os.path.abspath(download_dir)}")
         
-        # 1. Collect all messages containing media first
+        # 1. Collect all media messages first to establish index order
         print("Scanning channel messages...")
-        messages_to_download = []
+        media_messages = []
         async for message in client.iter_messages(channel, reverse=True):
             if message.media:
                 filename = None
-                file_size = None
-                
                 if message.file:
                     filename = message.file.name
-                    file_size = message.file.size
-                
-                if not filename:
-                    if hasattr(message.media, 'document') and message.media.document:
-                        file_size = message.media.document.size
-                        for attribute in message.media.document.attributes:
-                            if hasattr(attribute, 'file_name'):
-                                filename = attribute.file_name
-                                break
-                
+                if not filename and hasattr(message.media, 'document') and message.media.document:
+                    for attribute in message.media.document.attributes:
+                        if hasattr(attribute, 'file_name'):
+                            filename = attribute.file_name
+                            break
                 if not filename:
                     ext = message.file.ext if (message.file and message.file.ext) else ".jpg"
                     filename = f"media_msg_{message.id}{ext}"
-                    file_size = message.file.size if message.file else None
+                media_messages.append((message, filename))
 
-                target_path = os.path.join(download_dir, filename)
+        total_media = len(media_messages)
+        pad_width = len(str(total_media)) if total_media > 0 else 3
+        
+        messages_to_download = []
+        for idx, (message, filename) in enumerate(media_messages, start=1):
+            file_size = message.file.size if message.file else None
+            if not file_size and hasattr(message.media, 'document') and message.media.document:
+                file_size = message.media.document.size
                 
-                if os.path.exists(target_path):
-                    if file_size is None or os.path.getsize(target_path) == file_size:
-                        continue
-                
-                messages_to_download.append((message, filename, file_size))
-                
+            # Prefix filename with zero-padded index (e.g., 001_filename.mp4)
+            prefixed_filename = f"{idx:0{pad_width}d}_{filename}"
+            target_path = os.path.join(download_dir, prefixed_filename)
+            
+            # Skip if already downloaded fully
+            if os.path.exists(target_path):
+                if file_size is None or os.path.getsize(target_path) == file_size:
+                    continue
+                    
+            messages_to_download.append((message, prefixed_filename, file_size))
+            
         total_files = len(messages_to_download)
         if total_files == 0:
             print("No new files to download. All existing files are fully downloaded!")
