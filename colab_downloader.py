@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import math
+import shutil
 import hashlib
 import inspect
 import asyncio
@@ -18,7 +19,6 @@ from telethon.tl.functions.upload import GetFileRequest
 from telethon.tl.types import InputDocumentFileLocation, InputPhotoFileLocation, InputPeerPhotoFileLocation, InputFileLocation
 
 # ----------------- COLAB PERFORMANCE CONFIGURATION -----------------
-# Colab servers have massive bandwidth and fast virtual CPUs.
 MAX_CONCURRENT_FILES = 4       # We can run more files concurrently on Colab
 CONNECTIONS_PER_FILE = 4       # 4 connections per file is ideal
 CHUNK_SIZE_KB = 512            # Max chunk size
@@ -155,7 +155,6 @@ async def parallel_download_file(client: TelegramClient, location, out: BinaryIO
     return out
 
 # ----------------- SIMPLE LOGGER -----------------
-# Colab doesn't support clean cursor-move ANSI updates, so we use a simpler log format
 
 active_downloads = {}
 
@@ -183,10 +182,20 @@ def make_progress_callback(fname):
 # ----------------- MAIN DOWNLOADER -----------------
 
 async def download_lectures(api_id, api_hash, channel_source, download_dir):
-    # Colab lets us save the session file directly in Google Drive, so they only log in ONCE!
-    session_path = os.path.join(download_dir, 'colab_downloader_session')
+    # SQLite has lock issues on Google Drive FUSE mount.
+    # To fix this, we run SQLite locally in /content, but backup/restore it from Google Drive.
+    local_session_path = '/content/colab_downloader_session'
+    gdrive_session_path = '/content/drive/MyDrive/colab_downloader_session.session'
+    
+    if os.path.exists(gdrive_session_path):
+        try:
+            shutil.copy2(gdrive_session_path, local_session_path + '.session')
+            print("Loaded Telegram login session from Google Drive.")
+        except Exception as e:
+            print(f"Note: Could not import session file: {e}")
+            
     client = TelegramClient(
-        session_path, 
+        local_session_path, 
         api_id, 
         api_hash,
         connection_retries=15,
@@ -196,6 +205,13 @@ async def download_lectures(api_id, api_hash, channel_source, download_dir):
     await client.start()
     print("\nSuccessfully logged in to Telegram!")
     
+    # Save session back immediately on successful start
+    if os.path.exists('/content/drive/MyDrive'):
+        try:
+            shutil.copy2(local_session_path + '.session', gdrive_session_path)
+        except Exception:
+            pass
+            
     try:
         channel = await client.get_entity(channel_source)
         print(f"Accessing channel: {channel.title}")
@@ -296,9 +312,16 @@ async def download_lectures(api_id, api_hash, channel_source, download_dir):
         print(f"An error occurred: {e}")
     finally:
         await client.disconnect()
+        
+        # Backup the local session to Google Drive for next time
+        if os.path.exists('/content/drive/MyDrive') and os.path.exists(local_session_path + '.session'):
+            try:
+                shutil.copy2(local_session_path + '.session', gdrive_session_path)
+                print("Saved Telegram session back to Google Drive for future auto-logins.")
+            except Exception as e:
+                print(f"Note: Could not backup session to Google Drive: {e}")
 
 if __name__ == '__main__':
-    # Try reading credentials from config.json next to this script or in Google Drive
     import json
     config_paths = ['config.json', '/content/drive/MyDrive/telegram_downloader_config.json']
     config = None
@@ -322,7 +345,6 @@ if __name__ == '__main__':
         else:
             channel_source = channel_input
             
-        # Save to Google Drive if available
         gdrive_config = '/content/drive/MyDrive/telegram_downloader_config.json'
         try:
             with open('config.json', 'w') as f:
@@ -338,7 +360,6 @@ if __name__ == '__main__':
         api_hash = config['api_hash']
         channel_source = config['channel_source']
         
-    # Check if Google Drive is mounted
     gdrive_dir = '/content/drive/MyDrive/telegram_lectures'
     if os.path.exists('/content/drive/MyDrive'):
         download_dir = gdrive_dir
