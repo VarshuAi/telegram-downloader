@@ -97,7 +97,11 @@ async def mirror():
     # ── Scan source channel ──────────────────────────────────────────────────
     print("[TG] Scanning source channel for media messages...")
     media_msgs = []
+    scanned = 0
     async for msg in client.iter_messages(src, reverse=True):
+        scanned += 1
+        if scanned % 100 == 0:
+            print(f"  Scanned {scanned} messages... (found {len(media_msgs)} new media so far)")
         if msg.media and msg.id not in mirrored:
             media_msgs.append(msg)
 

@@ -38,7 +38,7 @@ jobs:
           TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
           TELEGRAM_CHANNEL_SOURCE: ${{ secrets.TELEGRAM_CHANNEL_SOURCE }}
           TELEGRAM_BACKUP_CHANNEL: ${{ secrets.TELEGRAM_BACKUP_CHANNEL }}
-        run: python channel_mirror.py
+        run: python -u channel_mirror.py
 
       # Save progress so next run skips already-mirrored files
       - name: Save mirror progress
