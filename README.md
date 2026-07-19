@@ -46,7 +46,7 @@ To allow the script to connect to Telegram's official API:
 3. Enter the requested details when prompted:
    - **Telegram App API_ID**
    - **Telegram App API_HASH**
-   - **Channel Link or Username** (e.g., `StriverDSA` or `https://t.me/StriverDSA`)
+   - **Channel Link or Username** (e.g., `alterDSA` or `https://t.me/alter.DSA`)
 4. On your first launch, the script will request:
    - Your **Phone Number** (with country code, e.g. `+91...`).
    - The login verification code sent to your Telegram app.
