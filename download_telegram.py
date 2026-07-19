@@ -15,6 +15,7 @@ from telethon.tl.alltlobjects import LAYER
 from telethon.tl.functions import InvokeWithLayerRequest
 from telethon.tl.functions.auth import ExportAuthorizationRequest, ImportAuthorizationRequest
 from telethon.tl.functions.upload import GetFileRequest
+from telethon.tl.types import InputDocumentFileLocation, InputPhotoFileLocation, InputPeerPhotoFileLocation, InputFileLocation
 
 # Enable ANSI escape codes in Windows Command Prompt
 if os.name == 'nt':
