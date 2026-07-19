@@ -26,7 +26,12 @@ if os.name == 'nt':
     except Exception:
         pass
 
-# ----------------- PARALLEL DOWNLOAD UTILITIES -----------------
+# ----------------- PERFORMANCE CONFIGURATION -----------------
+# Adjust these values to find the speed "sweet spot" for your connection:
+MAX_CONCURRENT_FILES = 2       # Number of files to download at the same time (1 or 2 is recommended)
+CONNECTIONS_PER_FILE = 4       # Number of parallel chunk connections per file (4-6 is usually best)
+CHUNK_SIZE_KB = 512            # Size of download parts in KB (512 is max allowed and recommended)
+# -------------------------------------------------------------
 
 TypeLocation = Union[InputDocumentFileLocation, InputPhotoFileLocation, InputPeerPhotoFileLocation, InputFileLocation]
 
@@ -76,7 +81,7 @@ class ParallelTransferrer:
         self.senders = None
 
     @staticmethod
-    def _get_connection_count(file_size: int, max_count: int = 16,
+    def _get_connection_count(file_size: int, max_count: int = CONNECTIONS_PER_FILE,
                                full_size: int = 50 * 1024 * 1024) -> int:
         if file_size > full_size:
             return max_count
@@ -152,8 +157,7 @@ async def parallel_download_file(client: TelegramClient, location, out: BinaryIO
     size = location.size
     dc_id, location = utils.get_input_location(location)
     downloader = ParallelTransferrer(client, dc_id)
-    # Set part_size_kb=512 and connection_count=16 for maximum speed on a single file
-    downloaded = downloader.download(location, size, part_size_kb=512, connection_count=16)
+    downloaded = downloader.download(location, size, part_size_kb=CHUNK_SIZE_KB, connection_count=CONNECTIONS_PER_FILE)
     async for chunk in downloaded:
         out.write(chunk)
         if progress_callback:
@@ -293,8 +297,8 @@ async def download_lectures(api_id, api_hash, channel_source, download_dir):
             
         print(f"Found {total_files} new files to download. Starting concurrent downloads...")
         
-        # 2. Download concurrently using a Semaphore (1 file at a time for maximum chunk throughput)
-        sem = asyncio.Semaphore(1)
+        # 2. Download concurrently using a Semaphore
+        sem = asyncio.Semaphore(MAX_CONCURRENT_FILES)
         download_count = 0
         
         async def download_task(message, filename, file_size):
