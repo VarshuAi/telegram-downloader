@@ -248,7 +248,7 @@ if __name__ == '__main__':
         api_id_input = input("Enter your Telegram App API_ID: ").strip()
         api_id = int(api_id_input)
         api_hash = input("Enter your Telegram App API_HASH: ").strip()
-        channel_input = input("Enter the Channel Link or Username (e.g., StriverDSA or https://t.me/StriverDSA): ").strip()
+        channel_input = input("Enter the Channel Link or Username (e.g., yourneededlec or https://t.me/DSA): ").strip()
         
         # Parse channel name if it's a full link
         if 't.me/' in channel_input:
