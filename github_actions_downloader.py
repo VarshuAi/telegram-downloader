@@ -332,6 +332,17 @@ async def run_pipeline():
         traceback.print_exc()
     finally:
         await client.disconnect()
+        # Cleanly cancel all pending Telethon background tasks to avoid
+        # "Task was destroyed but it is pending!" warnings
+        await asyncio.sleep(0.5)
+        pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
 if __name__ == '__main__':
+    import warnings
+    # Suppress ResourceWarning noise from asyncio on exit
+    warnings.filterwarnings('ignore', category=ResourceWarning)
     asyncio.run(run_pipeline())
