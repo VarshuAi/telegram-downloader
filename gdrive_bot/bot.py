@@ -246,11 +246,19 @@ def health():
 
 # ─── Start ─────────────────────────────────────────────────────────────────────
 
-if __name__ == '__main__':
-    if WEBHOOK_URL:
+# Set webhook at module level so it works with gunicorn too
+if WEBHOOK_URL:
+    try:
         bot.remove_webhook()
-        bot.set_webhook(url=f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}")
-        port = int(os.environ.get('PORT', 10000))
+        webhook_full = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
+        bot.set_webhook(url=webhook_full)
+        logging.info(f"Webhook set to: {webhook_full}")
+    except Exception as e:
+        logging.error(f"Failed to set webhook: {e}")
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 10000))
+    if WEBHOOK_URL:
         app.run(host='0.0.0.0', port=port)
     else:
         # Local testing — polling mode
