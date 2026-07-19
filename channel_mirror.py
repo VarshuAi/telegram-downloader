@@ -40,17 +40,35 @@ TEMP_DIR        = 'temp_mirror'
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def load_mirrored() -> set:
-    """Load already-mirrored message IDs from the progress file."""
+def load_mirrored(channel_key: str) -> set:
+    """Load already-mirrored message IDs from the progress file for this channel."""
     if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE) as f:
-            return set(json.load(f))
+        try:
+            with open(PROGRESS_FILE) as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return set(data.get(channel_key, []))
+                elif isinstance(data, list):
+                    # Migration path
+                    return set(data)
+        except Exception:
+            pass
     return set()
 
 
-def save_mirrored(ids: set):
+def save_mirrored(channel_key: str, ids: set):
+    data = {}
+    if os.path.exists(PROGRESS_FILE):
+        try:
+            with open(PROGRESS_FILE) as f:
+                old_data = json.load(f)
+                if isinstance(old_data, dict):
+                    data = old_data
+        except Exception:
+            pass
+    data[channel_key] = sorted(ids)
     with open(PROGRESS_FILE, 'w') as f:
-        json.dump(sorted(ids), f)
+        json.dump(data, f)
 
 
 def make_progress(label, total):
@@ -82,7 +100,8 @@ async def mirror():
         return
 
     os.makedirs(TEMP_DIR, exist_ok=True)
-    mirrored = load_mirrored()
+    channel_key = str(SOURCE_CHANNEL)
+    mirrored = load_mirrored(channel_key)
 
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH,
                             connection_retries=20, retry_delay=5)
@@ -167,7 +186,7 @@ async def mirror():
             print(f"  ✓ Uploaded to private channel")
 
             mirrored.add(msg.id)
-            save_mirrored(mirrored)
+            save_mirrored(channel_key, mirrored)
             done += 1
 
         except Exception as e:
