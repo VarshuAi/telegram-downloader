@@ -14,9 +14,6 @@ if os.name == 'nt':
     except Exception:
         pass
 
-# Destination folder for downloaded lectures
-DOWNLOAD_DIR = 'telegram_lectures'
-
 # Dashboard state management
 active_downloads = {}
 dashboard_lock = asyncio.Lock()
@@ -83,7 +80,7 @@ async def draw_dashboard():
         await clear_dashboard()
         await draw_dashboard_instantly()
 
-async def download_lectures(api_id, api_hash, channel_source):
+async def download_lectures(api_id, api_hash, channel_source, download_dir):
     # Initialize the client session with retry parameters
     client = TelegramClient(
         'lecture_downloader_session', 
@@ -102,8 +99,8 @@ async def download_lectures(api_id, api_hash, channel_source):
         print(f"Accessing channel: {channel.title}")
         
         # Create output directory
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        print(f"Saving lectures to directory: {os.path.abspath(DOWNLOAD_DIR)}")
+        os.makedirs(download_dir, exist_ok=True)
+        print(f"Saving lectures to directory: {os.path.abspath(download_dir)}")
         
         # 1. Collect all messages containing media first
         print("Scanning channel messages...")
@@ -131,7 +128,7 @@ async def download_lectures(api_id, api_hash, channel_source):
                     filename = f"media_msg_{message.id}{ext}"
                     file_size = message.file.size if message.file else None
 
-                target_path = os.path.join(DOWNLOAD_DIR, filename)
+                target_path = os.path.join(download_dir, filename)
                 
                 # If file already exists and size matches, skip download
                 if os.path.exists(target_path):
@@ -192,7 +189,7 @@ async def download_lectures(api_id, api_hash, channel_source):
                     try:
                         # Start downloading
                         await message.download_media(
-                            file=DOWNLOAD_DIR, 
+                            file=download_dir, 
                             progress_callback=make_progress_callback(filename)
                         )
                         
@@ -230,6 +227,24 @@ if __name__ == '__main__':
     print("   Telegram Parallel Media Downloader   ")
     print("=========================================\n")
     try:
+        # Prompt for folder first using native GUI dialog popup
+        print("Opening folder selection popup...")
+        import tkinter as tk
+        from tkinter import filedialog
+        
+        root = tk.Tk()
+        root.withdraw()                  # Hide primary window
+        root.attributes("-topmost", True)  # Pull popup to front
+        selected_dir = filedialog.askdirectory(title="Select Download Folder for Telegram Lectures")
+        root.destroy()                   # Fully close Tkinter session
+        
+        if not selected_dir:
+            print("No folder selected. Defaulting to 'telegram_lectures' in current directory.\n")
+            download_dir = 'telegram_lectures'
+        else:
+            download_dir = selected_dir
+            print(f"Downloads folder set to: {os.path.abspath(download_dir)}\n")
+            
         api_id_input = input("Enter your Telegram App API_ID: ").strip()
         api_id = int(api_id_input)
         api_hash = input("Enter your Telegram App API_HASH: ").strip()
@@ -241,7 +256,7 @@ if __name__ == '__main__':
         else:
             channel_source = channel_input
             
-        asyncio.run(download_lectures(api_id, api_hash, channel_source))
+        asyncio.run(download_lectures(api_id, api_hash, channel_source, download_dir))
     except ValueError:
         print("\n[Error] API_ID must be an integer number.")
     except KeyboardInterrupt:
