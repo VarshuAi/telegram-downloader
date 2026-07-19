@@ -5,6 +5,10 @@ on:
   schedule:
     - cron: '0 */6 * * *'   # auto-runs every 6 hours
 
+concurrency:
+  group: telegram-session-concurrency
+  cancel-in-progress: false
+
 jobs:
   mirror:
     runs-on: ubuntu-latest

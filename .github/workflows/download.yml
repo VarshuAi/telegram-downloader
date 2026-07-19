@@ -8,6 +8,10 @@ on:
   schedule:
     - cron: '0 */6 * * *'
 
+concurrency:
+  group: telegram-session-concurrency
+  cancel-in-progress: false
+
 jobs:
   download-and-upload:
     runs-on: ubuntu-latest
