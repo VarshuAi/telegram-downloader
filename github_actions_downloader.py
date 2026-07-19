@@ -1,203 +1,89 @@
 import os
-import sys
 import time
-import math
-import inspect
 import asyncio
-from typing import Optional, List, AsyncGenerator, Union, Awaitable, BinaryIO
 
-from telethon import TelegramClient, utils
+from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
-from telethon.crypto import AuthKey
-from telethon.network import MTProtoSender
-from telethon.tl.alltlobjects import LAYER
-from telethon.tl.functions import InvokeWithLayerRequest
-from telethon.tl.functions.auth import ExportAuthorizationRequest, ImportAuthorizationRequest
-from telethon.tl.functions.upload import GetFileRequest
-from telethon.tl.types import (InputDocumentFileLocation, InputPhotoFileLocation,
-                                InputPeerPhotoFileLocation, InputFileLocation)
 
 import google.oauth2.credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 # ----------------- CONFIGURATION (from GitHub Secrets) -----------------
-API_ID                  = int(os.environ.get('TELEGRAM_API_ID', 0))
-API_HASH                = os.environ.get('TELEGRAM_API_HASH', '')
-SESSION_STRING          = os.environ.get('TELEGRAM_SESSION_STRING', '')
-CHANNEL_SOURCE          = os.environ.get('TELEGRAM_CHANNEL_SOURCE', '')
-GDRIVE_FOLDER_ID        = os.environ.get('GDRIVE_FOLDER_ID', '')
-GDRIVE_CLIENT_ID        = os.environ.get('GDRIVE_CLIENT_ID', '')
-GDRIVE_CLIENT_SECRET    = os.environ.get('GDRIVE_CLIENT_SECRET', '')
-GDRIVE_REFRESH_TOKEN    = os.environ.get('GDRIVE_REFRESH_TOKEN', '')
+API_ID               = int(os.environ.get('TELEGRAM_API_ID', 0))
+API_HASH             = os.environ.get('TELEGRAM_API_HASH', '')
+SESSION_STRING       = os.environ.get('TELEGRAM_SESSION_STRING', '')
+CHANNEL_SOURCE       = os.environ.get('TELEGRAM_CHANNEL_SOURCE', '')
+GDRIVE_FOLDER_ID     = os.environ.get('GDRIVE_FOLDER_ID', '')
+GDRIVE_CLIENT_ID     = os.environ.get('GDRIVE_CLIENT_ID', '')
+GDRIVE_CLIENT_SECRET = os.environ.get('GDRIVE_CLIENT_SECRET', '')
+GDRIVE_REFRESH_TOKEN = os.environ.get('GDRIVE_REFRESH_TOKEN', '')
 
-# Reduced concurrency to avoid triggering ExportAuthorizationRequest FloodWait
-MAX_CONCURRENT_FILES    = 2
-CONNECTIONS_PER_FILE    = 2   # Lower = fewer cross-DC auth requests = no FloodWait
-CHUNK_SIZE_KB           = 512
-TEMP_DOWNLOAD_DIR       = 'temp_downloads'
+# Using standard single-connection download — no ExportAuthorizationRequest spam
+# GitHub's network is fast enough (30-70 MB/s) without parallel connections
+MAX_CONCURRENT_FILES = 2    # 2 files downloading simultaneously
+TEMP_DOWNLOAD_DIR    = 'temp_downloads'
 # -----------------------------------------------------------------------
 
-TypeLocation = Union[InputDocumentFileLocation, InputPhotoFileLocation,
-                     InputPeerPhotoFileLocation, InputFileLocation]
 
-# ====================== PARALLEL TELEGRAM DOWNLOADER ======================
+# ====================== PROGRESS TRACKER ======================
 
-class DownloadSender:
-    def __init__(self, client, sender, file, offset, limit, stride, count):
-        self.sender = sender
-        self.client = client
-        self.request = GetFileRequest(file, offset=offset, limit=limit)
-        self.stride = stride
-        self.remaining = count
-
-    async def next(self):
-        if not self.remaining:
-            return None
-        result = await self.client._call(self.sender, self.request)
-        self.remaining -= 1
-        self.request.offset += self.stride
-        return result.bytes
-
-    def disconnect(self):
-        return self.sender.disconnect()
-
-class ParallelTransferrer:
-    def __init__(self, client, dc_id=None):
-        self.client = client
-        self.loop = client.loop
-        self.dc_id = dc_id or client.session.dc_id
-        self.auth_key = (None if dc_id and client.session.dc_id != dc_id
-                         else client.session.auth_key)
-        self.senders = None
-
-    async def _cleanup(self):
-        await asyncio.gather(*[s.disconnect() for s in self.senders])
-        self.senders = None
-
-    async def _create_sender(self):
-        dc = await self.client._get_dc(self.dc_id)
-        sender = MTProtoSender(self.auth_key, loggers=self.client._log)
-        await sender.connect(self.client._connection(dc.ip_address, dc.port, dc.id,
-                                                      loggers=self.client._log,
-                                                      proxy=self.client._proxy))
-        if not self.auth_key:
-            auth = await self.client(ExportAuthorizationRequest(self.dc_id))
-            self.client._init_request.query = ImportAuthorizationRequest(id=auth.id, bytes=auth.bytes)
-            req = InvokeWithLayerRequest(LAYER, self.client._init_request)
-            await sender.send(req)
-            self.auth_key = sender.auth_key
-        return sender
-
-    async def _create_download_sender(self, file, index, part_size, stride, part_count):
-        return DownloadSender(self.client, await self._create_sender(),
-                              file, index * part_size, part_size, stride, part_count)
-
-    async def _init_download(self, connections, file, part_count, part_size):
-        minimum, remainder = divmod(part_count, connections)
-        def get_count():
-            nonlocal remainder
-            if remainder > 0:
-                remainder -= 1
-                return minimum + 1
-            return minimum
-
-        self.senders = [
-            await self._create_download_sender(file, 0, part_size, connections * part_size, get_count()),
-            *await asyncio.gather(
-                *[self._create_download_sender(file, i, part_size, connections * part_size, get_count())
-                  for i in range(1, connections)])
-        ]
-
-    async def download(self, file, file_size, part_size_kb=None, connection_count=None):
-        part_size = (part_size_kb or utils.get_appropriated_part_size(file_size)) * 1024
-        part_count = math.ceil(file_size / part_size)
-        connection_count = min(connection_count or CONNECTIONS_PER_FILE, part_count)
-        await self._init_download(connection_count, file, part_count, part_size)
-
-        part = 0
-        while part < part_count:
-            tasks = [self.loop.create_task(s.next()) for s in self.senders]
-            for task in tasks:
-                data = await task
-                if not data:
-                    break
-                yield data
-                part += 1
-
-        await self._cleanup()
-
-async def parallel_download_file(client, location, out, progress_callback=None):
-    size = location.size
-    dc_id, loc = utils.get_input_location(location)
-    downloader = ParallelTransferrer(client, dc_id)
-    async for chunk in downloader.download(loc, size, part_size_kb=CHUNK_SIZE_KB,
-                                           connection_count=CONNECTIONS_PER_FILE):
-        out.write(chunk)
-        if progress_callback:
-            r = progress_callback(out.tell(), size)
-            if inspect.isawaitable(r):
-                await r
-    return out
-
-def make_dl_progress(filename, file_size):
-    """Returns a progress callback that prints speed/ETA every 10% to GitHub Actions logs."""
+def make_progress(filename, file_size, arrow='↓'):
+    """Prints download/upload speed + ETA every 10%."""
+    short = (filename[:30] + '...') if len(filename) > 33 else filename
     state = {
         'last_pct': -1,
-        'start_time': time.time(),
-        'last_time': time.time(),
-        'last_bytes': 0,
+        'start': time.time(),
+        'last_t': time.time(),
+        'last_b': 0,
     }
-    short = filename[:30] + '...' if len(filename) > 33 else filename
 
-    def callback(received, total):
+    def cb(received, total):
         total = total or file_size or 1
         pct = int(received / total * 100)
-        # Log every 10% milestone
         if pct >= state['last_pct'] + 10 or received >= total:
             state['last_pct'] = pct
             now = time.time()
-            elapsed = now - state['last_time']
-            total_elapsed = now - state['start_time']
-            speed = (received - state['last_bytes']) / elapsed if elapsed > 0 else 0
-            avg_speed = received / total_elapsed if total_elapsed > 0 else 0
-            remaining = (total - received) / avg_speed if avg_speed > 0 else 0
-            eta_str = f"{int(remaining//60)}m {int(remaining%60)}s" if remaining > 60 else f"{int(remaining)}s"
+            dt = now - state['last_t']
+            elapsed = now - state['start']
+            inst_speed = (received - state['last_b']) / dt if dt > 0 else 0
+            avg_speed  = received / elapsed if elapsed > 0 else 0
+            remaining  = (total - received) / avg_speed if avg_speed > 0 else 0
+            eta = f"{int(remaining//60)}m {int(remaining%60)}s" if remaining > 60 else f"{int(remaining)}s"
             print(
-                f"  ↓ [{short}] {pct:3d}% "
-                f"| {received/1024/1024:.1f}/{total/1024/1024:.1f} MB "
-                f"| {speed/1024/1024:.2f} MB/s (inst) "
-                f"| {avg_speed/1024/1024:.2f} MB/s (avg) "
-                f"| ETA: {eta_str}"
+                f"  {arrow} [{short}] {pct:3d}%"
+                f" | {received/1048576:.1f}/{total/1048576:.1f} MB"
+                f" | {inst_speed/1048576:.2f} MB/s (inst)"
+                f" | {avg_speed/1048576:.2f} MB/s (avg)"
+                f" | ETA: {eta}"
             )
-            state['last_time'] = now
-            state['last_bytes'] = received
-    return callback
+            state['last_t'] = now
+            state['last_b'] = received
+
+    return cb
 
 
-# ====================== GOOGLE DRIVE UPLOADER ======================
+# ====================== GOOGLE DRIVE ======================
 
 gdrive_service = None
 existing_gdrive_files = {}
 
 def init_gdrive():
     global gdrive_service, existing_gdrive_files
-    
+
     missing = [k for k, v in {
-        'GDRIVE_CLIENT_ID': GDRIVE_CLIENT_ID,
+        'GDRIVE_CLIENT_ID':     GDRIVE_CLIENT_ID,
         'GDRIVE_CLIENT_SECRET': GDRIVE_CLIENT_SECRET,
         'GDRIVE_REFRESH_TOKEN': GDRIVE_REFRESH_TOKEN,
-        'GDRIVE_FOLDER_ID': GDRIVE_FOLDER_ID,
+        'GDRIVE_FOLDER_ID':     GDRIVE_FOLDER_ID,
     }.items() if not v]
-    
+
     if missing:
         print(f"[GDrive] Missing secrets: {', '.join(missing)}")
         return False
-        
+
     try:
-        # Use OAuth credentials (your personal Google account)
-        # Files go to YOUR Drive quota, not the service account's
         creds = google.oauth2.credentials.Credentials(
             token=None,
             refresh_token=GDRIVE_REFRESH_TOKEN,
@@ -206,66 +92,73 @@ def init_gdrive():
             token_uri='https://oauth2.googleapis.com/token'
         )
         gdrive_service = build('drive', 'v3', credentials=creds)
-        
+
         print("[GDrive] Scanning existing files in target folder...")
-        results = gdrive_service.files().list(
-            q=f"'{GDRIVE_FOLDER_ID}' in parents and trashed = false",
-            fields="files(id, name, size)",
-            pageSize=1000
-        ).execute()
-        
-        for f in results.get('files', []):
-            existing_gdrive_files[f['name']] = int(f.get('size', 0))
-            
-        print(f"[GDrive] Found {len(existing_gdrive_files)} existing files. Will skip those.")
+        page_token = None
+        while True:
+            resp = gdrive_service.files().list(
+                q=f"'{GDRIVE_FOLDER_ID}' in parents and trashed = false",
+                fields="nextPageToken, files(id, name, size)",
+                pageSize=1000,
+                pageToken=page_token
+            ).execute()
+            for f in resp.get('files', []):
+                existing_gdrive_files[f['name']] = int(f.get('size', 0))
+            page_token = resp.get('nextPageToken')
+            if not page_token:
+                break
+
+        print(f"[GDrive] Found {len(existing_gdrive_files)} existing files — will skip those.")
         return True
     except Exception as e:
         print(f"[GDrive] Failed to initialize: {e}")
         return False
+
 
 def upload_to_gdrive(file_path, filename):
     if not gdrive_service:
         return False
     try:
         file_size_bytes = os.path.getsize(file_path)
-        file_size_mb = file_size_bytes / (1024 * 1024)
-        
+        size_mb = file_size_bytes / 1048576
+
         file_metadata = {'name': filename, 'parents': [GDRIVE_FOLDER_ID]}
-        media = MediaFileUpload(file_path, chunksize=10*1024*1024, resumable=True)
-        
-        print(f"[GDrive] ↑ Uploading: {filename} ({file_size_mb:.1f} MB)")
+        media = MediaFileUpload(file_path, chunksize=10 * 1024 * 1024, resumable=True)
+
+        print(f"[GDrive] ↑ Uploading: {filename} ({size_mb:.1f} MB)")
         request = gdrive_service.files().create(body=file_metadata, media_body=media, fields='id')
-        
-        upload_start = time.time()
-        response = None
+
+        t_start = time.time()
         last_pct = 0
+        short = (filename[:30] + '...') if len(filename) > 33 else filename
+        response = None
+
         while response is None:
             status, response = request.next_chunk()
             if status:
                 pct = int(status.progress() * 100)
                 if pct >= last_pct + 20:
                     last_pct = pct
-                    elapsed = time.time() - upload_start
-                    uploaded_bytes = status.resumable_progress
-                    speed = uploaded_bytes / elapsed if elapsed > 0 else 0
-                    remaining_bytes = file_size_bytes - uploaded_bytes
-                    eta = remaining_bytes / speed if speed > 0 else 0
-                    eta_str = f"{int(eta//60)}m {int(eta%60)}s" if eta > 60 else f"{int(eta)}s"
-                    short = filename[:30] + '...' if len(filename) > 33 else filename
+                    elapsed = time.time() - t_start
+                    uploaded = status.resumable_progress
+                    speed = uploaded / elapsed if elapsed > 0 else 0
+                    remaining = (file_size_bytes - uploaded) / speed if speed > 0 else 0
+                    eta = f"{int(remaining//60)}m {int(remaining%60)}s" if remaining > 60 else f"{int(remaining)}s"
                     print(
-                        f"  \u2191 [{short}] {pct:3d}% "
-                        f"| {uploaded_bytes/1024/1024:.1f}/{file_size_mb:.1f} MB "
-                        f"| {speed/1024/1024:.2f} MB/s "
-                        f"| ETA: {eta_str}"
+                        f"  ↑ [{short}] {pct:3d}%"
+                        f" | {uploaded/1048576:.1f}/{size_mb:.1f} MB"
+                        f" | {speed/1048576:.2f} MB/s"
+                        f" | ETA: {eta}"
                     )
-                    
-        total_time = time.time() - upload_start
-        avg_up = file_size_bytes / total_time / 1024 / 1024 if total_time > 0 else 0
-        print(f"[GDrive] \u2713 Uploaded: {filename} in {total_time:.1f}s @ avg {avg_up:.2f} MB/s")
+
+        total_time = time.time() - t_start
+        avg_up = file_size_bytes / total_time / 1048576 if total_time > 0 else 0
+        print(f"[GDrive] ✓ Uploaded: {filename} in {total_time:.1f}s @ avg {avg_up:.2f} MB/s")
         return True
     except Exception as e:
         print(f"[GDrive] Upload failed for {filename}: {e}")
         return False
+
 
 # ====================== MAIN PIPELINE ======================
 
@@ -278,49 +171,56 @@ async def run_pipeline():
         print("Error: Google Drive setup failed. Exiting.")
         return
 
-    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH,
-                            connection_retries=15, retry_delay=5)
+    # Use standard single-connection client — no parallel DC connections = no FloodWait
+    client = TelegramClient(
+        StringSession(SESSION_STRING), API_ID, API_HASH,
+        connection_retries=20,
+        retry_delay=5,
+    )
     await client.start()
     print("[Telegram] Connected successfully!")
 
     try:
         channel = await client.get_entity(CHANNEL_SOURCE)
         print(f"[Telegram] Channel: {channel.title}")
-
         os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
 
+        # --- Scan channel for all media ---
         print("[Telegram] Scanning channel messages...")
         media_messages = []
         async for message in client.iter_messages(channel, reverse=True):
-            if message.media:
-                filename = None
-                if message.file:
-                    filename = message.file.name
-                if not filename and hasattr(message.media, 'document') and message.media.document:
-                    for attr in message.media.document.attributes:
-                        if hasattr(attr, 'file_name'):
-                            filename = attr.file_name
-                            break
-                if not filename:
-                    ext = message.file.ext if (message.file and message.file.ext) else '.jpg'
-                    filename = f"media_msg_{message.id}{ext}"
-                media_messages.append((message, filename))
+            if not message.media:
+                continue
+            filename = None
+            if message.file:
+                filename = message.file.name
+            if not filename and hasattr(message.media, 'document') and message.media.document:
+                for attr in message.media.document.attributes:
+                    if hasattr(attr, 'file_name'):
+                        filename = attr.file_name
+                        break
+            if not filename:
+                ext = (message.file.ext if message.file and message.file.ext else '.bin')
+                filename = f"media_msg_{message.id}{ext}"
+            media_messages.append((message, filename))
 
         total_media = len(media_messages)
-        pad_width = len(str(total_media)) if total_media > 0 else 3
+        pad = len(str(total_media)) if total_media > 0 else 3
 
+        # --- Filter out already-uploaded files ---
         to_download = []
         for idx, (message, filename) in enumerate(media_messages, start=1):
-            file_size = message.file.size if message.file else None
-            if not file_size and hasattr(message.media, 'document') and message.media.document:
+            file_size = None
+            if message.file:
+                file_size = message.file.size
+            if file_size is None and hasattr(message.media, 'document') and message.media.document:
                 file_size = message.media.document.size
 
-            prefixed = f"{idx:0{pad_width}d}_{filename}"
+            prefixed = f"{idx:0{pad}d}_{filename}"
 
-            # Skip if already in Google Drive with matching size
             if prefixed in existing_gdrive_files:
                 if file_size is None or existing_gdrive_files[prefixed] == file_size:
-                    continue
+                    continue  # already uploaded, skip
 
             to_download.append((message, prefixed, file_size))
 
@@ -338,19 +238,15 @@ async def run_pipeline():
             nonlocal done_count
             async with sem:
                 local_path = os.path.join(TEMP_DOWNLOAD_DIR, filename)
+                size_mb = (file_size or 0) / 1048576
 
-                # Step 1: Download from Telegram
+                # --- Download from Telegram (standard, no parallel DC tricks) ---
                 downloaded = False
-                for attempt in range(5):
+                for attempt in range(1, 6):
                     try:
-                        size_mb = (file_size or 0) / 1024 / 1024
-                        print(f"[Telegram] Downloading: {filename} ({size_mb:.1f} MB)")
-                        cb = make_dl_progress(filename, file_size)
-                        if hasattr(message.media, 'document') and message.media.document:
-                            with open(local_path, 'wb') as f:
-                                await parallel_download_file(client, message.media.document, f, progress_callback=cb)
-                        else:
-                            await message.download_media(file=local_path, progress_callback=cb)
+                        print(f"[Telegram] Downloading: {filename} ({size_mb:.1f} MB)  [attempt {attempt}]")
+                        cb = make_progress(filename, file_size, '↓')
+                        await message.download_media(file=local_path, progress_callback=cb)
                         downloaded = True
                         print(f"[Telegram] ✓ Downloaded: {filename}")
                         break
@@ -358,40 +254,22 @@ async def run_pipeline():
                         if os.path.exists(local_path):
                             os.remove(local_path)
                         wait = fw.seconds
-                        if wait > 120:
-                            # Too long to wait — fall back to safe standard downloader
-                            print(f"[Telegram] FloodWait {wait}s too long for parallel. Falling back to standard download for {filename}")
-                            try:
-                                cb = make_dl_progress(filename, file_size)
-                                await message.download_media(
-                                    file=local_path,
-                                    progress_callback=cb
-                                )
-                                downloaded = True
-                                print(f"[Telegram] ✓ Downloaded (standard): {filename}")
-                            except FloodWaitError as fw2:
-                                print(f"[Telegram] FloodWait {fw2.seconds}s even on standard downloader. Waiting...")
-                                await asyncio.sleep(fw2.seconds + 5)
-                            except Exception as e2:
-                                print(f"[Telegram] Standard fallback failed for {filename}: {e2}")
-                            break
-                        else:
-                            print(f"[Telegram] FloodWait {wait}s for {filename}. Waiting...")
-                            await asyncio.sleep(wait + 5)
+                        print(f"[Telegram] FloodWait {wait}s for {filename}. Waiting...")
+                        await asyncio.sleep(wait + 5)
                     except Exception as e:
                         if os.path.exists(local_path):
                             os.remove(local_path)
-                        print(f"[Telegram] Attempt {attempt+1} failed for {filename}: {e}")
-                        await asyncio.sleep(10)
+                        print(f"[Telegram] Attempt {attempt} failed for {filename}: {e}")
+                        await asyncio.sleep(15)
 
                 if not downloaded:
-                    print(f"[Error] Could not download {filename} after 5 attempts")
+                    print(f"[Error] Could not download {filename} after 5 attempts — will retry next run.")
                     return
 
-                # Step 2: Upload to Google Drive
+                # --- Upload to Google Drive ---
                 success = upload_to_gdrive(local_path, filename)
 
-                # Step 3: Delete local temp file immediately to save disk space
+                # --- Clean up temp file immediately ---
                 if os.path.exists(local_path):
                     os.remove(local_path)
 
@@ -403,6 +281,9 @@ async def run_pipeline():
         await asyncio.gather(*tasks)
 
         print(f"\nPipeline complete! Transferred {done_count}/{total} files to Google Drive.")
+        if done_count < total:
+            failed = total - done_count
+            print(f"  {failed} files failed — they will be retried on next scheduled run.")
 
     except Exception as e:
         print(f"Error: {e}")
@@ -410,8 +291,6 @@ async def run_pipeline():
         traceback.print_exc()
     finally:
         await client.disconnect()
-        # Cleanly cancel all pending Telethon background tasks to avoid
-        # "Task was destroyed but it is pending!" warnings
         await asyncio.sleep(0.5)
         pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         for task in pending:
@@ -419,8 +298,8 @@ async def run_pipeline():
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
+
 if __name__ == '__main__':
     import warnings
-    # Suppress ResourceWarning noise from asyncio on exit
     warnings.filterwarnings('ignore', category=ResourceWarning)
     asyncio.run(run_pipeline())
