@@ -1,0 +1,5 @@
+# Telegram Downloader Local Files
+config.json
+lecture_downloader_session.session
+lecture_downloader_session.session-journal
+telegram_lectures/

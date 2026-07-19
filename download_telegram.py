@@ -383,6 +383,34 @@ async def download_lectures(api_id, api_hash, channel_source, download_dir):
     finally:
         await client.disconnect()
 
+# Configuration persistence
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(SCRIPT_DIR, 'config.json')
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            import json
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return None
+
+def save_config(api_id, api_hash, channel_source):
+    try:
+        import json
+        config = {
+            'api_id': api_id,
+            'api_hash': api_hash,
+            'channel_source': channel_source
+        }
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(config, f, indent=4)
+        print("Credentials saved locally to config.json.")
+    except Exception as e:
+        print(f"Warning: Could not save credentials: {e}")
+
 if __name__ == '__main__':
     print("=========================================")
     print("   Telegram Parallel Media Downloader   ")
@@ -405,15 +433,40 @@ if __name__ == '__main__':
             download_dir = selected_dir
             print(f"Downloads folder set to: {os.path.abspath(download_dir)}\n")
             
-        api_id_input = input("Enter your Telegram App API_ID: ").strip()
-        api_id = int(api_id_input)
-        api_hash = input("Enter your Telegram App API_HASH: ").strip()
-        channel_input = input("Enter the Channel Link or Username (e.g., yourneededlec or https://t.me/DSA): ").strip()
+        config = load_config()
+        use_saved = False
         
-        if 't.me/' in channel_input:
-            channel_source = channel_input.split('t.me/')[-1].strip('/')
+        if config:
+            print("--- Found saved credentials ---")
+            print(f"API_ID: {config.get('api_id')}")
+            # Obfuscate API HASH for security on screen
+            api_hash_val = config.get('api_hash', '')
+            masked_hash = (api_hash_val[:4] + '*' * 10 + api_hash_val[-4:]) if len(api_hash_val) > 8 else '**********'
+            print(f"API_HASH: {masked_hash}")
+            print(f"Channel: {config.get('channel_source')}")
+            print("--------------------------------")
+            choice = input("Use these saved credentials? (y/n) [Default: y]: ").strip().lower()
+            if choice in ('y', 'yes', ''):
+                use_saved = True
+                print("Using saved credentials.\n")
+        
+        if use_saved:
+            api_id = int(config['api_id'])
+            api_hash = config['api_hash']
+            channel_source = config['channel_source']
         else:
-            channel_source = channel_input
+            api_id_input = input("Enter your Telegram App API_ID: ").strip()
+            api_id = int(api_id_input)
+            api_hash = input("Enter your Telegram App API_HASH: ").strip()
+            channel_input = input("Enter the Channel Link or Username (e.g., StriverDSA or https://t.me/StriverDSA): ").strip()
+            
+            if 't.me/' in channel_input:
+                channel_source = channel_input.split('t.me/')[-1].strip('/')
+            else:
+                channel_source = channel_input
+            
+            # Save newly input config
+            save_config(api_id, api_hash, channel_source)
             
         asyncio.run(download_lectures(api_id, api_hash, channel_source, download_dir))
     except ValueError:
