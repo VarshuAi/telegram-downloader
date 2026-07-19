@@ -8,6 +8,7 @@ from typing import Optional, List, AsyncGenerator, Union, Awaitable, BinaryIO
 
 from telethon import TelegramClient, utils
 from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError
 from telethon.crypto import AuthKey
 from telethon.network import MTProtoSender
 from telethon.tl.alltlobjects import LAYER
@@ -31,8 +32,9 @@ GDRIVE_CLIENT_ID        = os.environ.get('GDRIVE_CLIENT_ID', '')
 GDRIVE_CLIENT_SECRET    = os.environ.get('GDRIVE_CLIENT_SECRET', '')
 GDRIVE_REFRESH_TOKEN    = os.environ.get('GDRIVE_REFRESH_TOKEN', '')
 
-MAX_CONCURRENT_FILES    = 4   # GitHub Actions has fast network, 4 concurrent is safe
-CONNECTIONS_PER_FILE    = 4
+# Reduced concurrency to avoid triggering ExportAuthorizationRequest FloodWait
+MAX_CONCURRENT_FILES    = 2
+CONNECTIONS_PER_FILE    = 2   # Lower = fewer cross-DC auth requests = no FloodWait
 CHUNK_SIZE_KB           = 512
 TEMP_DOWNLOAD_DIR       = 'temp_downloads'
 # -----------------------------------------------------------------------
@@ -300,11 +302,34 @@ async def run_pipeline():
                         downloaded = True
                         print(f"[Telegram] ✓ Downloaded: {filename}")
                         break
+                    except FloodWaitError as fw:
+                        if os.path.exists(local_path):
+                            os.remove(local_path)
+                        wait = fw.seconds
+                        if wait > 120:
+                            # Too long to wait — fall back to safe standard downloader
+                            print(f"[Telegram] FloodWait {wait}s too long for parallel. Falling back to standard download for {filename}")
+                            try:
+                                await message.download_media(
+                                    file=local_path,
+                                    progress_callback=None
+                                )
+                                downloaded = True
+                                print(f"[Telegram] ✓ Downloaded (standard): {filename}")
+                            except FloodWaitError as fw2:
+                                print(f"[Telegram] FloodWait {fw2.seconds}s even on standard downloader. Waiting...")
+                                await asyncio.sleep(fw2.seconds + 5)
+                            except Exception as e2:
+                                print(f"[Telegram] Standard fallback failed for {filename}: {e2}")
+                            break
+                        else:
+                            print(f"[Telegram] FloodWait {wait}s for {filename}. Waiting...")
+                            await asyncio.sleep(wait + 5)
                     except Exception as e:
                         if os.path.exists(local_path):
                             os.remove(local_path)
                         print(f"[Telegram] Attempt {attempt+1} failed for {filename}: {e}")
-                        await asyncio.sleep(5)
+                        await asyncio.sleep(10)
 
                 if not downloaded:
                     print(f"[Error] Could not download {filename} after 5 attempts")
