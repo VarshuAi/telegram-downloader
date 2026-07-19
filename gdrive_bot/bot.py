@@ -71,21 +71,34 @@ def upload_to_gdrive(file_path, filename, folder_id=None, status_cb=None):
     folder_id = folder_id or GDRIVE_FOLDER_ID
     size_mb = os.path.getsize(file_path) / 1048576
     metadata = {'name': filename, 'parents': [folder_id]}
-    media = MediaFileUpload(file_path, chunksize=10 * 1024 * 1024, resumable=True)
+    # 50MB chunks = faster upload on good connections
+    media = MediaFileUpload(file_path, chunksize=50 * 1024 * 1024, resumable=True)
     req = service.files().create(body=metadata, media_body=media, fields='id,webViewLink')
 
     last_pct = 0
+    t_start = time.time()
     response = None
     while response is None:
         status, response = req.next_chunk()
         if status and status_cb:
             pct = int(status.progress() * 100)
-            if pct >= last_pct + 25:
+            if pct >= last_pct + 20:
                 last_pct = pct
                 done_mb = size_mb * status.progress()
-                status_cb(f"☁️ Uploading to GDrive... {pct}% ({done_mb:.1f}/{size_mb:.1f} MB)")
+                elapsed = time.time() - t_start
+                speed = (done_mb * 1048576) / elapsed / 1048576 if elapsed > 0 else 0
+                status_cb(f"☁️ Uploading... {pct}% | {done_mb:.1f}/{size_mb:.1f} MB | {speed:.1f} MB/s")
 
-    return response.get('webViewLink', '')
+    link = response.get('webViewLink', '')
+    file_id = response.get('id', '')
+    # Make it directly openable (not just viewable)
+    if file_id:
+        service.permissions().create(
+            fileId=file_id,
+            body={'type': 'anyone', 'role': 'reader'},
+        ).execute()
+        link = f"https://drive.google.com/file/d/{file_id}/view"
+    return link
 
 
 # ─── Utility ─────────────────────────────────────────────────────────────────
@@ -296,8 +309,14 @@ def handle_file(message):
             update(f"☁️ Uploading *{filename}* to GDrive...")
             folder_id = get_active_folder(message.from_user.id)
             folder_name = next((k for k, v in FOLDER_MAP.items() if v == folder_id), folder_id)
-            upload_to_gdrive(local, filename, folder_id=folder_id, status_cb=lambda t: update(t))
-            update(f"✅ *Done!*\n📁 `{filename}`\n💾 {size_mb:.1f} MB\n📂 Folder: *{folder_name}*")
+            link = upload_to_gdrive(local, filename, folder_id=folder_id, status_cb=lambda t: update(t))
+            update(
+                f"✅ *Done!*\n"
+                f"📁 `{filename}`\n"
+                f"💾 {size_mb:.1f} MB\n"
+                f"📂 Folder: *{folder_name}*\n"
+                f"🔗 [Open in Drive]({link})"
+            )
 
     except Exception as e:
         update(f"❌ Failed: {str(e)[:300]}")
@@ -334,8 +353,14 @@ def handle_telegram_link(message):
             folder_id = get_active_folder(message.from_user.id)
             folder_name = next((k for k, v in FOLDER_MAP.items() if v == folder_id), folder_id)
             update(f"☁️ Uploading *{filename}* ({size_mb:.1f} MB) to GDrive...")
-            upload_to_gdrive(local, filename, folder_id=folder_id, status_cb=lambda t: update(t))
-            update(f"✅ *Done!*\n📁 `{filename}`\n💾 {size_mb:.1f} MB\n📂 Folder: *{folder_name}*")
+            link = upload_to_gdrive(local, filename, folder_id=folder_id, status_cb=lambda t: update(t))
+            update(
+                f"✅ *Done!*\n"
+                f"📁 `{filename}`\n"
+                f"💾 {size_mb:.1f} MB\n"
+                f"📂 Folder: *{folder_name}*\n"
+                f"🔗 [Open in Drive]({link})"
+            )
 
     except Exception as e:
         update(f"❌ Failed: {str(e)[:300]}")
@@ -407,8 +432,14 @@ def handle_url(message):
             folder_id = get_active_folder(message.from_user.id)
             folder_name = next((k for k, v in FOLDER_MAP.items() if v == folder_id), folder_id)
             update(f"☁️ Uploading *{filename}* ({size_mb:.1f} MB) to GDrive...")
-            upload_to_gdrive(local, filename, folder_id=folder_id, status_cb=lambda t: update(t))
-            update(f"✅ *Done!*\n📁 `{filename}`\n💾 {size_mb:.1f} MB\n📂 Folder: *{folder_name}*")
+            link = upload_to_gdrive(local, filename, folder_id=folder_id, status_cb=lambda t: update(t))
+            update(
+                f"✅ *Done!*\n"
+                f"📁 `{filename}`\n"
+                f"💾 {size_mb:.1f} MB\n"
+                f"📂 Folder: *{folder_name}*\n"
+                f"🔗 [Open in Drive]({link})"
+            )
 
     except Exception as e:
         update(f"❌ Failed: {str(e)[:300]}")
