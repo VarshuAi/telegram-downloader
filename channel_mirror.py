@@ -173,7 +173,7 @@ async def fast_download(client, msg, local_path, progress_cb=None):
                 res = None
                 if sender:
                     try:
-                        res = await sender.send(req)
+                        res = await sender(req)
                     except Exception:
                         res = None
 
