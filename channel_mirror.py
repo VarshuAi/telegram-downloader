@@ -125,20 +125,8 @@ from telethon.tl.functions.upload import GetFileRequest
 from telethon.tl.types import InputDocumentFileLocation
 
 async def fast_download(client, msg, local_path, progress_cb=None):
-    """Fast download using Telethon's built-in download_file with 512KB chunk size."""
-    try:
-        if hasattr(msg, 'media') and msg.media:
-            await client.download_file(
-                msg.media,
-                file=local_path,
-                part_size_kb=512,
-                progress_callback=progress_cb
-            )
-        else:
-            await msg.download_media(file=local_path, progress_callback=progress_cb)
-    except Exception as e:
-        # Fallback to standard download_media if download_file encounters an issue
-        await msg.download_media(file=local_path, progress_callback=progress_cb)
+    """Download media file directly using Telethon's Message.download_media."""
+    return await msg.download_media(file=local_path, progress_callback=progress_cb)
 
 
 async def mirror():
@@ -183,7 +171,7 @@ async def mirror():
         if scanned % 100 == 0:
             print(f"  Scanned {scanned} messages... (found {len(media_msgs)} new media so far)")
         
-        if not msg.media:
+        if not msg.media or not msg.file:
             continue
 
         # Get filename
