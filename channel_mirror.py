@@ -125,76 +125,20 @@ from telethon.tl.functions.upload import GetFileRequest
 from telethon.tl.types import InputDocumentFileLocation
 
 async def fast_download(client, msg, local_path, progress_cb=None):
-    """Parallel chunk downloader for Telethon — 10x-50x faster (15-40 MB/s)."""
-    if not msg.media or not hasattr(msg.media, 'document') or not msg.media.document:
-        return await msg.download_media(file=local_path, progress_callback=progress_cb)
-
-    doc = msg.media.document
-    file_size = doc.size
-    part_size = 512 * 1024  # 512 KB chunks
-    parts_count = math.ceil(file_size / part_size)
-
-    location = InputDocumentFileLocation(
-        id=doc.id,
-        access_hash=doc.access_hash,
-        file_reference=doc.file_reference,
-        thumb_size=''
-    )
-
-    WORKERS = 8  # 8 parallel connections for maximum speed
-    queue = asyncio.Queue()
-    for i in range(parts_count):
-        queue.put_nowait(i)
-
-    downloaded_bytes = 0
-    lock = asyncio.Lock()
-
-    # Pre-allocate file space on disk
-    with open(local_path, 'wb') as f:
-        f.truncate(file_size)
-
-    async def worker():
-        nonlocal downloaded_bytes
-        try:
-            sender = await client._borrow_sender(doc.dc_id)
-        except Exception:
-            sender = None
-
-        try:
-            while not queue.empty():
-                try:
-                    part_index = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-
-                offset = part_index * part_size
-                req = GetFileRequest(location, offset=offset, limit=part_size)
-                
-                res = None
-                if sender:
-                    try:
-                        res = await sender(req)
-                    except Exception:
-                        res = None
-
-                if not res:
-                    res = await client(req)
-
-                if res and res.bytes:
-                    with open(local_path, 'r+b') as f:
-                        f.seek(offset)
-                        f.write(res.bytes)
-
-                    async with lock:
-                        downloaded_bytes += len(res.bytes)
-                        if progress_cb:
-                            progress_cb(downloaded_bytes, file_size)
-        finally:
-            if sender:
-                await client._return_sender(doc.dc_id, sender)
-
-    tasks = [asyncio.create_task(worker()) for _ in range(WORKERS)]
-    await asyncio.gather(*tasks)
+    """Fast download using Telethon's built-in download_file with 512KB chunk size."""
+    try:
+        if hasattr(msg, 'media') and msg.media:
+            await client.download_file(
+                msg.media,
+                file=local_path,
+                part_size_kb=512,
+                progress_callback=progress_cb
+            )
+        else:
+            await msg.download_media(file=local_path, progress_callback=progress_cb)
+    except Exception as e:
+        # Fallback to standard download_media if download_file encounters an issue
+        await msg.download_media(file=local_path, progress_callback=progress_cb)
 
 
 async def mirror():
