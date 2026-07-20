@@ -18,6 +18,15 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeFilename
 
+# Load .env file if running locally
+if os.path.exists('.env'):
+    with open('.env') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                k, v = line.split('=', 1)
+                os.environ[k.strip()] = v.strip().strip('"').strip("'")
+
 # ─── Config ───────────────────────────────────────────────────────────────────
 API_ID          = int(os.environ.get('TELEGRAM_API_ID', 0))
 API_HASH        = os.environ.get('TELEGRAM_API_HASH', '')
@@ -77,7 +86,8 @@ def make_progress(label, total):
     def cb(received, tot):
         tot = tot or total or 1
         pct = int(received / tot * 100)
-        if pct >= state['last_pct'] + 10 or received >= tot:
+        # Update every 5%
+        if pct >= state['last_pct'] + 5 or received >= tot:
             state['last_pct'] = pct
             now = time.time()
             dt = now - state['last_t']
@@ -86,8 +96,19 @@ def make_progress(label, total):
             avg  = received / el / 1048576 if el > 0 else 0
             rem  = (tot - received) / (avg * 1048576) if avg > 0 else 0
             eta  = f"{int(rem//60)}m {int(rem%60)}s" if rem > 60 else f"{int(rem)}s"
-            print(f"  {label} {pct:3d}% | {received/1048576:.1f}/{tot/1048576:.1f} MB"
-                  f" | {inst:.1f} MB/s | avg {avg:.1f} MB/s | ETA {eta}")
+            
+            # Visual progress bar: [██████░░░░]
+            bar_len = 15
+            filled = int(bar_len * pct / 100)
+            bar = '█' * filled + '░' * (bar_len - filled)
+            
+            print(
+                f"  {label} [{bar}] {pct:3d}% "
+                f"| {received/1048576:.1f}/{tot/1048576:.1f} MB "
+                f"| {inst:.1f} MB/s (speed) "
+                f"| {avg:.1f} MB/s (avg) "
+                f"| ETA: {eta}"
+            )
             state['last_t'] = now
             state['last_b'] = received
     return cb
