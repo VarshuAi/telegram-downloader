@@ -80,16 +80,26 @@ def save_mirrored(channel_key: str, ids: set):
         json.dump(data, f)
 
 
+import sys
+
 def make_progress(label, total):
-    state = {'last_pct': -1, 'start': time.time(), 'last_t': time.time(), 'last_b': 0}
+    state = {
+        'last_pct': -1,
+        'start': time.time(),
+        'last_t': time.time(),
+        'last_b': 0,
+        'last_print': 0
+    }
 
     def cb(received, tot):
         tot = tot or total or 1
         pct = int(received / tot * 100)
-        # Update every 5%
-        if pct >= state['last_pct'] + 5 or received >= tot:
+        now = time.time()
+        
+        # Update if 5% change OR 2 seconds elapsed OR download complete
+        if pct >= state['last_pct'] + 5 or (now - state['last_print'] >= 2.0) or received >= tot:
             state['last_pct'] = pct
-            now = time.time()
+            state['last_print'] = now
             dt = now - state['last_t']
             el = now - state['start']
             inst = (received - state['last_b']) / dt / 1048576 if dt > 0 else 0
@@ -107,7 +117,8 @@ def make_progress(label, total):
                 f"| {received/1048576:.1f}/{tot/1048576:.1f} MB "
                 f"| {inst:.1f} MB/s (speed) "
                 f"| {avg:.1f} MB/s (avg) "
-                f"| ETA: {eta}"
+                f"| ETA: {eta}",
+                flush=True
             )
             state['last_t'] = now
             state['last_b'] = received
@@ -203,13 +214,14 @@ async def mirror():
         size_mb = file_size / 1048576
 
         local_path = os.path.join(TEMP_DIR, filename)
-        print(f"\n[{done+1}/{total}] {filename} ({size_mb:.1f} MB)")
+        print(f"\n[{done+1}/{total}] {filename} ({size_mb:.1f} MB)", flush=True)
 
         # --- Download from source ---
         try:
             dl_cb = make_progress("↓", file_size)
+            dl_cb(0, file_size)  # Print initial 0% line immediately
             await msg.download_media(file=local_path, progress_callback=dl_cb)
-            print(f"  ✓ Downloaded")
+            print(f"  ✓ Downloaded", flush=True)
         except Exception as e:
             print(f"  ✗ Download failed: {e}")
             failed.append(msg.id)
