@@ -81,6 +81,11 @@ def save_mirrored(channel_key: str, ids: set):
 
 
 import sys
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 def make_progress(label, total):
     state = {
@@ -107,22 +112,23 @@ def make_progress(label, total):
             rem  = (tot - received) / (avg * 1048576) if avg > 0 else 0
             eta  = f"{int(rem//60)}m {int(rem%60)}s" if rem > 60 else f"{int(rem)}s"
             
-            # Visual progress bar: [██████░░░░]
+            # ASCII progress bar: [======-----]
             bar_len = 15
             filled = int(bar_len * pct / 100)
-            bar = '█' * filled + '░' * (bar_len - filled)
+            bar = '=' * filled + '-' * (bar_len - filled)
             
             print(
-                f"  {label} [{bar}] {pct:3d}% "
+                f"  [{label}] [{bar}] {pct:3d}% "
                 f"| {received/1048576:.1f}/{tot/1048576:.1f} MB "
                 f"| {inst:.1f} MB/s (speed) "
                 f"| {avg:.1f} MB/s (avg) "
                 f"| ETA: {eta}",
                 flush=True
             )
-import math
-from telethon.tl.functions.upload import GetFileRequest
-from telethon.tl.types import InputDocumentFileLocation
+            state['last_t'] = now
+            state['last_b'] = received
+    return cb
+
 
 async def fast_download(client, msg, local_path, progress_cb=None):
     """Download media file directly using Telethon's Message.download_media."""
@@ -222,12 +228,12 @@ async def mirror():
 
         # --- Download from source ---
         try:
-            dl_cb = make_progress("↓", file_size)
+            dl_cb = make_progress("DN", file_size)
             dl_cb(0, file_size)  # Print initial 0% line immediately
             await fast_download(client, msg, local_path, progress_cb=dl_cb)
-            print(f"  ✓ Downloaded", flush=True)
+            print(f"  [OK] Downloaded", flush=True)
         except Exception as e:
-            print(f"  ✗ Download failed: {e}")
+            print(f"  [FAIL] Download failed: {e}", flush=True)
             failed.append(msg.id)
             if os.path.exists(local_path):
                 os.remove(local_path)
@@ -235,8 +241,8 @@ async def mirror():
 
         # --- Upload to private channel ---
         try:
-            ul_cb = make_progress("↑", file_size)
-            caption = f"📎 {filename}"
+            ul_cb = make_progress("UP", file_size)
+            caption = f"FILE: {filename}"
             if msg.message:
                 caption += f"\n{msg.message}"
 
@@ -248,14 +254,14 @@ async def mirror():
                 supports_streaming=True,    # still streamable in Telegram apps
                 progress_callback=ul_cb,
             )
-            print(f"  ✓ Uploaded to private channel")
+            print(f"  [OK] Uploaded to private channel", flush=True)
 
             mirrored.add(msg.id)
             save_mirrored(channel_key, mirrored)
             done += 1
 
         except Exception as e:
-            print(f"  ✗ Upload failed: {e}")
+            print(f"  [FAIL] Upload failed: {e}", flush=True)
             failed.append(msg.id)
         finally:
             if os.path.exists(local_path):
